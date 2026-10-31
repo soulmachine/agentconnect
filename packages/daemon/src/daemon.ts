@@ -30419,7 +30419,11 @@ export class Daemon {
     // from re-arming itself (its callback re-arms only `if (!this.draining)`), so a
     // sweep firing during the awaits below can't leave a dangling timer behind.
     this.draining = true
-    await this.localApi?.close()
+    // Started now, awaited at the end: an await here would delay the draining digest below.
+    const localApiClosed = this.localApi?.close().then(
+      () => undefined,
+      (e: unknown) => e
+    )
     // Stop claiming before anything else: no rendezvous claim, no grant admitted, and the next
     // digest says `draining` with zero headroom — sent now rather than at the next tick, so the CP
     // stops granting to this member within one round trip of the SIGTERM.
@@ -30594,6 +30598,8 @@ export class Daemon {
     // After the hosts (and thus their spawned mcp-bridge subprocesses) are gone,
     // so server.close() isn't left waiting on a live bridge connection.
     await Promise.resolve(this.mcp?.stop()).catch((e) => errors.push(e))
+    const localApiError = await localApiClosed
+    if (localApiError) errors.push(localApiError)
     await this.computerTools.close().catch((e: unknown) => errors.push(e))
     this.gitCredServer?.stop()
     // Local loops end with the process; dropping them here just makes the timers stop promptly.
