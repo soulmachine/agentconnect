@@ -5560,6 +5560,7 @@ export class Daemon {
               defs: this.mcpDefsForAgent(agent.id),
               caps: this.runtimeFacts.mcpCapabilities(agent.runtime),
               hostsUiServer: (name) => this.appsHost.isUiServer(this.orgForAgent(agent.id), name),
+              session: { channel, thread, key: sessionKey },
               warn: (warning) => warnings.push(warning)
             })
         return {
