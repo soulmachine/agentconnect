@@ -105,6 +105,7 @@ export interface PlatformActionSink {
   ) => void
   handleElicitChoice: NonNullable<SlackDeps['onElicitChoice']>
   handleElicitFormSubmit: NonNullable<SlackDeps['onElicitFormSubmit']>
+  handleCardChoice: NonNullable<SlackDeps['onCardChoice']>
   handleDiscordSelect: NonNullable<DiscordDeps['onSelectAction']>
   openElicitEditor: NonNullable<DiscordDeps['onElicitOpen']>
   /** A tapped elicitation-card option, or Dismiss (`token` null); `ts` is the card's id as the tap reports it. */
@@ -476,6 +477,7 @@ export class ConnectionReconciler {
         this.host.handlePermissionChoice({ ...a, srcIntegrationIds: this.host.srcIntegrationIds(conn()) }),
       onElicitChoice: (a) => this.host.handleElicitChoice(a),
       onElicitFormSubmit: (a) => this.host.handleElicitFormSubmit(a),
+      onCardChoice: (a) => this.host.handleCardChoice(a),
       log: this.log,
       boltDebug: this.host.boltDebug()
     }
@@ -808,6 +810,7 @@ export class ConnectionReconciler {
             onPermissionChoice: (a) => this.host.handlePermissionChoice(a),
             onElicitChoice: (a) => this.host.handleElicitChoice(a),
             onElicitFormSubmit: (a) => this.host.handleElicitFormSubmit(a),
+            onCardChoice: (a) => this.host.handleCardChoice(a),
             log: this.log
           },
           this.host.slackAppFactory()

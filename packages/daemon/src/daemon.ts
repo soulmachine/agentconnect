@@ -891,6 +891,8 @@ import { ClientTransport, systemClock, type Clock, type TimerHandle } from '@age
 import { z } from 'zod'
 import { LocalApiServer, type LocalApiReply } from './local-api/server.js'
 import { doorbellRoute, type DoorbellRequest } from './local-api/doorbell.js'
+import { ChoiceCards } from './cards/choice-cards.js'
+import { slackChoiceCardSurface } from './platforms/slack/choice-card.js'
 import { OUTSIDE_HUMAN_SCOPE_REMINDER, isNoResponseBody, isNoResponsePrefix } from './session/no-response.js'
 import { codeHostReplySnapshot, sessionReplyRoute } from './session/reply-route.js'
 import { WorkspaceConflictError } from './cp/workspace-reader.js'
@@ -3052,6 +3054,10 @@ export class Daemon {
         await this.permissions.handleElicitChoice(a)
       },
       handleElicitFormSubmit: (a) => void this.permissions.submitElicitForm(a),
+      handleCardChoice: (a) =>
+        void this.choiceCards()
+          .click(a)
+          .catch((err) => this.log.warn(`choice card click failed: ${formatErr(err)}`)),
       handleDiscordSelect: (a) => this.commands.handleDiscordSelect(a),
       openElicitEditor: (a) => this.permissions.openElicitEditor(a.requestId),
       handleElicitCardTap: async (a) => await this.permissions.handleElicitCardTap(a),
@@ -5219,6 +5225,7 @@ export class Daemon {
         this.activeTurnSearchOrigin.get(
           sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
         ),
+      choiceCards: () => this.choiceCards(),
       shareTarget: (ctx): ShareTargetResult => {
         const key = sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
         const t = this.activeTurnShare.get(key)
@@ -29451,11 +29458,53 @@ export class Daemon {
     this.localApi = new LocalApiServer({
       port: cfg.localApi.port,
       token: cfg.localApi.token,
-      routes: [doorbellRoute((req) => this.ringDoorbell(req))],
+      routes: [doorbellRoute((req) => this.ringDoorbell(req)), ...this.choiceCards().routes()],
       log: this.log
     })
     const port = await this.localApi.start()
     this.log.info(`local api: listening on 127.0.0.1:${port}`)
+  }
+
+  private choiceCardService?: ChoiceCards
+
+  /** Sticky choice cards (store-backed, so a click after a restart still starts its turn). */
+  private choiceCards(): ChoiceCards {
+    return (this.choiceCardService ??= new ChoiceCards({
+      ledger: this.store.choiceCards,
+      resolveAgent: (name, integrationId) => {
+        const agent = this.agents.get(name) ?? [...this.agents.values()].find((a) => a.name === name)
+        const integration = integrationId
+          ? agent?.integrations.find((i) => i.id === integrationId)
+          : agent?.integrations[0]
+        return agent && integration
+          ? { agentId: agent.id, integrationId: integration.id, platform: integration.platform }
+          : undefined
+      },
+      surfaceFor: (integrationId) => {
+        const conn = this.connByIntegration.get(integrationId) as Partial<SlackConnection> | undefined
+        return conn?.postBlocks && conn.updateBlocks
+          ? slackChoiceCardSurface(conn as unknown as SlackConnection)
+          : undefined
+      },
+      startTurn: async (card, text) => {
+        const traceId = randomUUID()
+        const msg: NormalizedMessage = {
+          msgId: `card:${card.cardId}`,
+          traceId,
+          source: 'user',
+          platform: card.platform,
+          channel: card.channel,
+          thread: card.thread,
+          sender: { id: card.clickedBy!, isBot: false, ...(card.clickedByName ? { name: card.clickedByName } : {}) },
+          text,
+          mentionedBots: [],
+          isDm: false
+        }
+        await this.dispatch(card.agentId, msg, card.integrationId, undefined, undefined, { requireDurable: true })
+      },
+      now: () => this.clock.now(),
+      log: this.log
+    }))
   }
 
   /** The doorbell: a local process asks an agent for a turn, in a thread or in a new top-level post. */
