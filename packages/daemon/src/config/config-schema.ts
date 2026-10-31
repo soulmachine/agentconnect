@@ -206,6 +206,8 @@ export const ConfigSchema = z.object({
       z.object({ backend: z.literal('postgres'), configFile: z.string().min(1) })
     ])
     .default({ backend: 'sqlite' }),
+  // A loopback REST surface for processes on this host (the doorbell), behind one bearer token; off when absent.
+  localApi: z.object({ port: z.number().int().min(0).max(65535), token: z.string().min(16) }).optional(),
   agentsDir: z.string().optional(), // resolved against root if absent
   runtimes: z.record(z.string(), RuntimeDefSchema).optional(),
   // MCP servers this daemon can attach to agent sessions (reported to the CP as
