@@ -49,10 +49,19 @@ async function world() {
     downloadFile: vi.fn(async () => null)
   }
   daemon.connByIntegration.set(INT, conn)
-  const dispatch = vi.fn(async (_agent: string, _msg: unknown, _int: string, _w: unknown, _c: unknown, opts: any) => {
-    await opts?.onAdmission?.({ accepted: true })
-    return 'acp-1'
-  })
+  const dispatch = vi.fn(
+    async (
+      _agent: string,
+      _msg: unknown,
+      _int: string,
+      _w: unknown,
+      _c: unknown,
+      opts: any
+    ): Promise<string | null> => {
+      await opts?.onAdmission?.({ accepted: true })
+      return 'acp-1'
+    }
+  )
   daemon.dispatch = dispatch
   return { daemon, store, conn, dispatch }
 }
