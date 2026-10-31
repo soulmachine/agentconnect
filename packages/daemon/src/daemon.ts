@@ -889,6 +889,10 @@ import { CP_IDENTITY_TOKEN_PATH, readClusterIdentityToken } from './cp/cluster-i
 import { CpCollabRoutes, isSyntheticA2aChannel } from './cp/cp-collab-routes.js'
 import { ClientTransport, systemClock, type Clock, type TimerHandle } from '@agentconnect.md/connection'
 import { z } from 'zod'
+import { LocalApiServer, type LocalApiReply } from './local-api/server.js'
+import { doorbellRoute, type DoorbellRequest } from './local-api/doorbell.js'
+import { ChoiceCards } from './cards/choice-cards.js'
+import { slackChoiceCardSurface } from './platforms/slack/choice-card.js'
 import { OUTSIDE_HUMAN_SCOPE_REMINDER, isNoResponseBody, isNoResponsePrefix } from './session/no-response.js'
 import { codeHostReplySnapshot, sessionReplyRoute } from './session/reply-route.js'
 import { WorkspaceConflictError } from './cp/workspace-reader.js'
@@ -2014,6 +2018,7 @@ export class Daemon {
   // Kubernetes readiness (#1043): the two sinks a pod probe reads, and the one fact only this
   // member knows — that the install-wide sandbox runtime probe came back.
   private readiness?: ReadinessGate
+  private localApi?: LocalApiServer
   // The executor facet (session-executors.md §3): dark unless `sandbox.share`, and all of its logic lives in `execution/executor-facet.ts`.
   private executorFacet?: ExecutorFacet
   // The holder half (§7): this daemon's own sessions placed on other machines of its group. Empty until one is.
@@ -3049,6 +3054,10 @@ export class Daemon {
         await this.permissions.handleElicitChoice(a)
       },
       handleElicitFormSubmit: (a) => void this.permissions.submitElicitForm(a),
+      handleCardChoice: (a) =>
+        void this.choiceCards()
+          .click(a)
+          .catch((err) => this.log.warn(`choice card click failed: ${formatErr(err)}`)),
       handleDiscordSelect: (a) => this.commands.handleDiscordSelect(a),
       openElicitEditor: (a) => this.permissions.openElicitEditor(a.requestId),
       handleElicitCardTap: async (a) => await this.permissions.handleElicitCardTap(a),
@@ -3658,6 +3667,7 @@ export class Daemon {
     await this.registerAgentCrons(agents)
     this.watchAgentConfigs()
     await this.replayDurableWork()
+    await this.startLocalApi(cfg)
     this.armTimersAndReadiness(root, startControlPlane)
   }
 
@@ -5215,6 +5225,7 @@ export class Daemon {
         this.activeTurnSearchOrigin.get(
           sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
         ),
+      choiceCards: () => this.choiceCards(),
       shareTarget: (ctx): ShareTargetResult => {
         const key = sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
         const t = this.activeTurnShare.get(key)
@@ -29442,6 +29453,115 @@ export class Daemon {
     return { message: msg, postAttempted }
   }
 
+  /** Open the loopback REST surface (`localApi` in config) once platform connections exist. */
+  private async startLocalApi(cfg: Config): Promise<void> {
+    if (!cfg.localApi) return
+    this.localApi = new LocalApiServer({
+      port: cfg.localApi.port,
+      token: cfg.localApi.token,
+      routes: [doorbellRoute((req) => this.ringDoorbell(req)), ...this.choiceCards().routes()],
+      log: this.log
+    })
+    const port = await this.localApi.start()
+    this.log.info(`local api: listening on 127.0.0.1:${port}`)
+  }
+
+  private choiceCardService?: ChoiceCards
+
+  /** Sticky choice cards (store-backed, so a click after a restart still starts its turn). */
+  private choiceCards(): ChoiceCards {
+    return (this.choiceCardService ??= new ChoiceCards({
+      ledger: this.store.choiceCards,
+      resolveAgent: (name, integrationId) => {
+        const agent = this.agents.get(name) ?? [...this.agents.values()].find((a) => a.name === name)
+        const integration = integrationId
+          ? agent?.integrations.find((i) => i.id === integrationId)
+          : agent?.integrations[0]
+        return agent && integration
+          ? { agentId: agent.id, integrationId: integration.id, platform: integration.platform }
+          : undefined
+      },
+      surfaceFor: (integrationId) => {
+        const conn = this.connByIntegration.get(integrationId) as Partial<SlackConnection> | undefined
+        return conn?.postBlocks && conn.updateBlocks
+          ? slackChoiceCardSurface(conn as unknown as SlackConnection)
+          : undefined
+      },
+      startTurn: async (card, text) => {
+        const traceId = randomUUID()
+        const msg: NormalizedMessage = {
+          msgId: `card:${card.cardId}`,
+          traceId,
+          source: 'user',
+          platform: card.platform,
+          channel: card.channel,
+          thread: card.thread,
+          sender: { id: card.clickedBy!, isBot: false, ...(card.clickedByName ? { name: card.clickedByName } : {}) },
+          text,
+          mentionedBots: [],
+          isDm: false
+        }
+        await this.dispatch(card.agentId, msg, card.integrationId, undefined, undefined, { requireDurable: true })
+      },
+      now: () => this.clock.now(),
+      log: this.log
+    }))
+  }
+
+  /** The doorbell: a local process asks an agent for a turn, in a thread or in a new top-level post. */
+  private async ringDoorbell(req: DoorbellRequest): Promise<LocalApiReply> {
+    const agent = this.agents.get(req.agent) ?? [...this.agents.values()].find((a) => a.name === req.agent)
+    if (!agent) return { status: 404, body: { error: `unknown agent "${req.agent}"` } }
+    if (!this.servesAgent(agent.id)) return { status: 409, body: { error: 'agent is served by another member' } }
+    const integration = req.integrationId
+      ? agent.integrations.find((i) => i.id === req.integrationId)
+      : agent.integrations[0]
+    if (!integration) return { status: 400, body: { error: 'agent has no such integration' } }
+    const traceId = randomUUID()
+    let msg: NormalizedMessage = {
+      msgId: `doorbell:${traceId}`,
+      traceId,
+      source: 'system',
+      platform: integration.platform,
+      channel: req.channel,
+      thread: req.thread ?? `doorbell:${traceId}`,
+      sender: { id: 'doorbell', isBot: false },
+      text: req.text,
+      mentionedBots: [],
+      isDm: false
+    }
+    if (req.thread) {
+      const conn = this.replyConnFor(agent.id, integration.id) as
+        { getChannelInfo?: (ch: string) => Promise<{ isIm?: boolean } | undefined> } | undefined
+      const info = await conn?.getChannelInfo?.(req.channel).catch(() => undefined)
+      if (info?.isIm) msg = { ...msg, isDm: true }
+    } else {
+      const { message } = await this.anchorTrigger(
+        agent.id,
+        msg,
+        { channel: req.channel, integrationId: integration.id },
+        req.post ?? req.text,
+        'doorbell'
+      )
+      // anchorTrigger runs on without output when the post fails; a doorbell caller needs the thread instead.
+      if (!message || message.thread === msg.thread)
+        return { status: 503, body: { error: 'could not post into the channel (paused, draining or not connected)' } }
+      msg = message
+    }
+    const admission = new Promise<{ accepted: boolean; reason?: string }>((resolve) => {
+      void this.dispatch(agent.id, msg, integration.id, undefined, undefined, {
+        requireDurable: true,
+        onAdmission: (result) => resolve(result)
+      })
+        .then(() => resolve({ accepted: false, reason: 'not admitted' }))
+        .catch((err) => resolve({ accepted: false, reason: formatErr(err) }))
+    })
+    const result = await admission
+    if (!result.accepted)
+      return { status: 409, body: { error: result.reason ?? 'refused', channel: msg.channel, thread: msg.thread } }
+    return { status: 202, body: { channel: msg.channel, thread: msg.thread } }
+  }
+
   /** A cron's or hook's own post into the target an editor configured: that target counts as consent, so a public channel the bot is not in is joined without asking (#2979). */
   private async postIntoConfiguredTarget<T>(
     conn: unknown,
@@ -30349,6 +30469,11 @@ export class Daemon {
     // from re-arming itself (its callback re-arms only `if (!this.draining)`), so a
     // sweep firing during the awaits below can't leave a dangling timer behind.
     this.draining = true
+    // Started now, awaited at the end: an await here would delay the draining digest below.
+    const localApiClosed = this.localApi?.close().then(
+      () => undefined,
+      (e: unknown) => e
+    )
     // Stop claiming before anything else: no rendezvous claim, no grant admitted, and the next
     // digest says `draining` with zero headroom — sent now rather than at the next tick, so the CP
     // stops granting to this member within one round trip of the SIGTERM.
@@ -30523,6 +30648,8 @@ export class Daemon {
     // After the hosts (and thus their spawned mcp-bridge subprocesses) are gone,
     // so server.close() isn't left waiting on a live bridge connection.
     await Promise.resolve(this.mcp?.stop()).catch((e) => errors.push(e))
+    const localApiError = await localApiClosed
+    if (localApiError) errors.push(localApiError)
     await this.computerTools.close().catch((e: unknown) => errors.push(e))
     this.gitCredServer?.stop()
     // Local loops end with the process; dropping them here just makes the timers stop promptly.

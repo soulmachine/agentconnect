@@ -1,3 +1,4 @@
+import { postChoiceCard, readChoiceCard, updateChoiceCard, type ChoiceCardOpsDeps } from './ops/choice-cards.js'
 import { randomUUID } from 'node:crypto'
 import {
   listDecisions,
@@ -233,7 +234,8 @@ export interface OpsDeps
     AssistantItemDeps,
     AssistantReminderDeps,
     AssistantSubsessionDeps,
-    CapabilityRequestDeps {
+    CapabilityRequestDeps,
+    ChoiceCardOpsDeps {
   /** Rejected tool arguments are logged here at debug, key names only — the sole trace of them (#1921). */
   log?: Pick<Logger, 'debug'>
   /** Fail-closed turn gate checked before every daemon bridge tool. Used to make
@@ -281,6 +283,9 @@ export interface OpsDeps
  */
 const HANDLERS: Map<string, ToolHandler<OpsDeps>> = new Map<string, ToolHandler<OpsDeps>>([
   ['shareFile', shareFile],
+  ['postChoiceCard', postChoiceCard],
+  ['readChoiceCard', readChoiceCard],
+  ['updateChoiceCard', updateChoiceCard],
   ['viewSessionStatus', viewSessionStatus],
   ['describeMemoryEntries', describeMemoryEntries],
   ['listMemoryEntries', listMemoryEntries],
