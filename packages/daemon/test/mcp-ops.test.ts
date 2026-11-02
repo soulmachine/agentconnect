@@ -289,6 +289,30 @@ describe('executeTool: sendMessage (channel post)', () => {
       expect(gw.postMessage).not.toHaveBeenCalled()
     })
 
+    it('judges the caller’s own thread by where this turn delivers, so a task in a room it holds may tell its origin', async () => {
+      // auto-session-mode.md §6.8: the session is keyed on its origin thread while this turn answers in the room.
+      const gw = gatewayWithThread('111.1')
+      const { deps: d } = deps(gw)
+      d.deliveryChannelNow = () => 'C_ROOM'
+      d.deliveryThreadNow = () => 'C_ROOM'
+      await executeTool(
+        ctx,
+        'sendMessage',
+        { action: 'postMessage', channel: 'C_CURRENT', thread: '111.1', message: 'done' },
+        d
+      )
+      expect(gw.postMessage).toHaveBeenCalledWith('C_CURRENT', 'done', '111.1', expect.anything())
+      await expect(
+        executeTool(
+          ctx,
+          'sendMessage',
+          { action: 'postMessage', channel: 'C_ROOM', thread: 'C_ROOM', message: 'hi' },
+          d
+        )
+      ).rejects.toThrow(/the thread this turn is delivering to/)
+      expect(gw.postMessage).toHaveBeenCalledTimes(1)
+    })
+
     it('refuses a thread id that is not a root, rather than posting at the root', async () => {
       // A reply's own id would post into the right thread but key a session no reply reaches.
       const gw = gatewayWithThread()
@@ -839,6 +863,19 @@ describe('executeTool: sendMessage (channel post)', () => {
       // must stay a real, comparable platform ts.
       expect(spawns[0]).toMatchObject({ thread: 'tg:172', postTs: '172' })
       expect(recorded[0]).toMatchObject({ thread: 'tg:172', ts: '172' })
+    })
+
+    it('records a root post into a conversation keyed as one session there, and seeds no second session', async () => {
+      // A Slack code channel is one session on the channel, so the post belongs to it, as a reply there does.
+      const { d, spawns, recorded } = tgDeps({}, { roomThread: async (channel) => channel })
+      await executeTool(
+        tgCtx,
+        'sendMessage',
+        { action: 'postMessage', platform: 'telegram', channel: '-100123', message: 'hi' },
+        d
+      )
+      expect(recorded[0]).toMatchObject({ channel: '-100123', thread: '-100123', ts: '172' })
+      expect(spawns).toEqual([])
     })
 
     it('anchors a peer wake to that same key', async () => {

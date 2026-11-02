@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import pg from 'pg'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
+import { shortTaskIds } from '../src/assistant/task-ids.js'
 import { Daemon } from '../src/daemon.js'
 import { subsessionCoordinate } from '../src/session/subsession-coordinate.js'
 import { LocalStore, SCHEMA_VERSION, sessionKey } from '../src/store/local-store.js'
@@ -38,6 +39,17 @@ const row = (agentId: string, id: string, parentSessionId = 'sid-parent-1') => (
   now: 1_000
 })
 
+/** A follow-up, a watch task (assistant-mode.md §5.18), indexed under the rows' owner. */
+const openWatch = (s: LocalStore, agentId: string, id: string, now: number) =>
+  s.assistantWatchTasks.open({
+    taskKey: childKey(agentId, id),
+    agentId,
+    title: `Follow-up ${id}`,
+    origin: { platform: 'slack', channel: 'C0GENERAL', transportScope: 'T0EXAMPLE' },
+    owner: { sessionId: 'sid-parent-1', key: row(agentId, id).parentSessionKey },
+    now
+  })
+
 describe('the assistant sub-session index', () => {
   it('records a delegation once, partitioned by agent', async () => {
     const s = await open()
@@ -50,7 +62,8 @@ describe('the assistant sub-session index', () => {
       parentSessionId: 'sid-parent-1',
       parentSessionKey: sessionKey('slack', 'C0GENERAL', 'append:1', a, 'T0EXAMPLE'),
       state: 'open',
-      createdAt: 1_000
+      createdAt: 1_000,
+      changedAt: 1_000
     })
     expect(await s.assistantSubsessions.get(agent(), childKey(a, '1'))).toBeUndefined()
   })
@@ -199,7 +212,7 @@ describe('the assistant sub-session index', () => {
     const owner = { sessionId: 'sid-parent-1', key: row(a, 'x').parentSessionKey }
     await index.open({ ...row(a, 'done'), now: 1_000 })
     await index.open({ ...row(a, 'task-approved'), now: 2_000 })
-    await index.openFollowUp({ ...row(a, 'check-1'), now: 3_000 })
+    await openWatch(s, a, 'check-1', 3_000)
     await index.open({ ...row(a, 'running'), now: 500 })
     await index.finish(a, childKey(a, 'done'), 'done')
     await index.finish(a, childKey(a, 'check-1'), 'failed')
@@ -217,7 +230,7 @@ describe('the assistant sub-session index', () => {
       childKey(a, 'check-1'),
       childKey(a, 'done')
     ])
-    expect(all.rows.find((r) => r.childSessionKey === childKey(a, 'check-1'))).toMatchObject({ kind: 'follow-up' })
+    expect(all.rows.find((r) => r.childSessionKey === childKey(a, 'check-1'))).toMatchObject({ mode: 'watch' })
     // A session that does not own its place's follow-ups lists none of them.
     const without = await index.listForOwner(a, owner, 10, { followUps: false })
     expect([keys(without.rows), without.total]).toEqual([
@@ -255,7 +268,7 @@ describe('the assistant sub-session index', () => {
     await index.open({ ...row(a, 'delegated'), now: 1_000 })
     await index.open({ ...row(a, 'research-1'), now: 2_000 })
     await index.open({ ...row(a, 'task-approved'), now: 3_000 })
-    await index.openFollowUp({ ...row(a, 'check-1'), now: 4_000 })
+    await openWatch(s, a, 'check-1', 4_000)
     const keys = (rows: { childSessionKey: string }[]) => rows.map((r) => r.childSessionKey).sort()
     const own = await index.listForOwner(a, owner, 10, { delegatedTasks: false })
     expect([keys(own.rows), own.total]).toEqual([
@@ -309,7 +322,7 @@ describe('the failure report a sub-session index row holds (assistant-mode.md §
     const index = s.assistantSubsessions
     await index.open({ ...row(a, '1'), now: 2_000 })
     for (const id of ['2', '3', '4']) await index.open(row(a, id))
-    await index.openFollowUp(row(a, 'check-5'))
+    await openWatch(s, a, 'check-5', 1_000)
     await index.checking(a, childKey(a, 'check-5'))
     await index.open(row(b, '6'))
     await index.finish(a, childKey(a, '3'), 'done')
@@ -574,10 +587,13 @@ describe('the task model: title, summary and attached threads (auto-session-mode
         lastDeliveredTs: null,
         updatedAt
       })
-    expect((await index.closeIdleThreaded(a, 5_000)).sort()).toEqual(
+    expect((await index.closeIdleThreaded(a, 5_000, 6_000)).sort()).toEqual(
       [childKey(a, 'idle'), childKey(a, 'unstarted')].sort()
     )
+    // Closed reads as gone everywhere but readTask's record, which is kept for a window (assistant-mode.md §5.18 ④).
     expect(await index.get(a, childKey(a, 'idle'))).toBeUndefined()
+    expect(await index.record(a, childKey(a, 'idle'))).toMatchObject({ state: 'done', closedAt: 6_000 })
+    expect((await index.listPlaced(a)).map((one) => one.childSessionKey)).not.toContain(childKey(a, 'idle'))
     const at = { platform: 'slack', channel: 'C0GENERAL', transportScope: 'T0EXAMPLE', thread: '100.0' }
     expect(await index.taskOfThread(a, at)).toBeUndefined()
     for (const id of ['active', 'running', 'background']) expect(await index.get(a, childKey(a, id))).toBeDefined()
@@ -661,11 +677,30 @@ describe('the task model: title, summary and attached threads (auto-session-mode
       [onThread('100.1'), onThread('100.2'), childKey(a, 'holder')].sort()
     )
     expect(tasks.find((task) => task.childSessionKey === onThread('100.1'))?.parentSessionKey).toBe('coordinator-key')
-    for (const task of tasks) expect(await index.closeTask(a, task.childSessionKey)).toBe(true)
+    for (const task of tasks) expect(await index.closeTask(a, task.childSessionKey, 9_800)).toBe(true)
     expect(await index.closeTask(a, onThread('100.1'))).toBe(false)
     expect(await index.get(a, onThread('100.1'))).toBeUndefined()
+    expect(await index.record(a, onThread('100.1'))).toMatchObject({ closedAt: 9_800, title: 'Fix the flaky test' })
     expect(await index.threadsOf(a, onThread('100.1'))).toEqual([])
     expect(await index.threadedConversations(a)).toEqual([])
+    // A closed task's session is unowned again, and adopting it again replaces the closed record under the same id.
+    expect((await index.unownedThreadSessions(a, conversation, 5_000)).map((one) => one.key)).toEqual([
+      onThread('100.1'),
+      onThread('100.2'),
+      onThread('100.7')
+    ])
+    expect(
+      await index.adoptThreadSession({
+        agentId: a,
+        childSessionKey: onThread('100.1'),
+        ...parent,
+        ...conversation,
+        thread: '100.1',
+        running: false,
+        now: 9_900
+      })
+    ).toBe(true)
+    expect(await index.record(a, onThread('100.1'))).not.toHaveProperty('closedAt')
   })
 
   it('lists and retires a conversation’s coordinator only while it is still the one in force', async () => {
@@ -736,6 +771,295 @@ describe('the task model: title, summary and attached threads (auto-session-mode
     expect(await index.threadsOf(a, childKey(a, '2'))).toEqual([])
   })
 })
+
+describe('retained closed tasks (assistant-mode.md §5.18 ④)', () => {
+  it('keeps a closed work task out of every live read, its threads and inputs gone, and lets its key open again', async () => {
+    const s = await open()
+    const a = agent()
+    const index = s.assistantSubsessions
+    const key = childKey(a, 'done')
+    const openedFor = { place: 'slack:C0GENERAL', messageId: 'msg-1700000000.000100' }
+    await index.open({ ...row(a, 'done'), title: 'Retry webhooks', openedFor })
+    await index.attachThread({
+      agentId: a,
+      childSessionKey: key,
+      platform: 'slack',
+      channel: 'C0GENERAL',
+      transportScope: 'T0EXAMPLE',
+      thread: '100.1',
+      sinceRound: 1,
+      now: 1_000
+    })
+    expect(await index.claimInput(a, 'submission-1', key, 1_000)).toBe(true)
+    await index.setSummary(a, key, { summary: 'Done: PR #12 merged.', now: 1_500 })
+    expect(await index.closeTask(a, key, 2_000)).toBe(true)
+    expect(await index.closeTask(a, key, 3_000)).toBe(false)
+
+    expect(await index.record(a, key)).toMatchObject({
+      closedAt: 2_000,
+      title: 'Retry webhooks',
+      summary: 'Done: PR #12 merged.',
+      openedFor
+    })
+    expect(await index.taskOpenedFor(a, openedFor)).toBe(key)
+    expect(await index.get(a, key)).toBeUndefined()
+    expect(await index.list(a, 10)).toEqual([])
+    expect(await index.listPlaced(a)).toEqual([])
+    const parent = { sessionId: 'sid-parent-1', key: row(a, 'done').parentSessionKey }
+    expect(await index.listForOwner(a, parent, 10)).toEqual({ rows: [], total: 0 })
+    expect(await index.threadsOf(a, key)).toEqual([])
+    expect(await index.getInput(a, 'submission-1')).toBeUndefined()
+    // Nothing reaches a closed task: no summary, no turn count, no round, no thread.
+    expect(await index.setSummary(a, key, { summary: 'later', now: 4_000 })).toBe(false)
+    expect(await index.countTurn(a, key)).toBeUndefined()
+    expect(await index.resumeThreaded(a, key, 4_000)).toBe(false)
+    expect(
+      await index.attachThread({
+        agentId: a,
+        childSessionKey: key,
+        platform: 'slack',
+        channel: 'C0GENERAL',
+        thread: '100.2',
+        sinceRound: 1,
+        now: 4_000
+      })
+    ).toBe(false)
+    expect(
+      await index.recordOpened(a, key, {
+        kind: 'pull request',
+        label: 'o/r#1',
+        url: 'https://github.com/o/r/pull/1',
+        now: 4_000
+      })
+    ).toBe(false)
+
+    // A new task on the same key takes its id; the closed record goes.
+    expect(await index.open({ ...row(a, 'done'), title: 'Again', now: 5_000 })).toBe(true)
+    expect(await index.get(a, key)).toMatchObject({ title: 'Again', state: 'open' })
+    expect(await index.record(a, key)).not.toHaveProperty('closedAt')
+  })
+
+  it('closes a work task when its session is purged, drops a getting-to-know row, and keeps a follow-up', async () => {
+    const s = await open()
+    const a = agent()
+    const index = s.assistantSubsessions
+    const seed = async (id: string) =>
+      await s.upsertSession({
+        key: childKey(a, id),
+        agentId: a,
+        platform: 'slack',
+        channel: 'C0GENERAL',
+        thread: subsessionCoordinate(id),
+        transportScope: 'T0EXAMPLE',
+        acpSessionId: `acp-${id}`,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: 1_000
+      })
+    await index.open({ ...row(a, 'work'), title: 'Sort the backlog' })
+    await index.openGettingToKnow({
+      ...row(a, 'check-look-1'),
+      place: { platform: 'slack', channel: 'C0GENERAL', transportScope: 'T0EXAMPLE' }
+    })
+    await openWatch(s, a, 'check-1', 1_000)
+    // A getting-to-know task's row says what it is (assistant-mode.md §5.18 ⑤); a follow-up's does not.
+    expect(await index.get(a, childKey(a, 'check-look-1'))).toMatchObject({ mode: 'watch', gettingToKnow: true })
+    expect(await index.get(a, childKey(a, 'check-1'))).not.toHaveProperty('gettingToKnow')
+    for (const id of ['work', 'check-look-1', 'check-1']) {
+      await seed(id)
+      await s.deleteSession(childKey(a, id), { reason: 'retention', at: 2_000 })
+    }
+    expect(await index.get(a, childKey(a, 'work'))).toBeUndefined()
+    expect(await index.record(a, childKey(a, 'work'))).toMatchObject({
+      title: 'Sort the backlog',
+      closedAt: expect.any(Number)
+    })
+    expect(await index.record(a, childKey(a, 'check-look-1'))).toBeUndefined()
+    expect(await index.get(a, childKey(a, 'check-1'))).toMatchObject({ mode: 'watch', watchStatus: 'waiting' })
+  })
+
+  it('closes a follow-up when it ends, which its live reads still show as ended', async () => {
+    const s = await open()
+    const a = agent()
+    await openWatch(s, a, 'check-1', 1_000)
+    await s.assistantWatchTasks.schedule(a, childKey(a, 'check-1'), { status: 'active', nextAt: 9_000 }, 1_500)
+    expect(await s.assistantSubsessions.record(a, childKey(a, 'check-1'))).not.toHaveProperty('closedAt')
+    expect(
+      await s.assistantWatchTasks.schedule(a, childKey(a, 'check-1'), { status: 'dropped', nextAt: null }, 2_000)
+    ).toBe(true)
+    expect(await s.assistantSubsessions.get(a, childKey(a, 'check-1'))).toMatchObject({
+      watchStatus: 'dropped',
+      closedAt: 2_000
+    })
+    expect(await s.assistantWatchTasks.get(a, childKey(a, 'check-1'))).toMatchObject({ status: 'dropped' })
+  })
+
+  it('resolves a taskId from its key or a unique prefix, and finds none for an ambiguous one', async () => {
+    const s = await open()
+    const a = agent()
+    const index = s.assistantSubsessions
+    for (const id of ['d-1', 'd-12', 'd-2']) await index.open(row(a, id))
+    await index.closeTask(a, childKey(a, 'd-2'), 2_000)
+    expect(await index.resolve(a, childKey(a, 'd-1'))).toBe(childKey(a, 'd-1'))
+    expect(await index.resolve(a, childKey(a, 'd-12').slice(0, -10))).toBe(childKey(a, 'd-12'))
+    // A closed task within its window resolves too, for readTask.
+    expect(await index.resolve(a, 'slack:C0GENERAL:subsession:d-2')).toBe(childKey(a, 'd-2'))
+    expect(await index.resolve(a, 'slack:C0GENERAL:subsession:d-1')).toBeUndefined()
+    expect(await index.resolve(a, 'slack:C0GENERAL:subsession:d-')).toBeUndefined()
+    expect(await index.resolve(a, 'slack:C0OTHER')).toBeUndefined()
+    expect(await index.resolve(agent(), childKey(a, 'd-1'))).toBeUndefined()
+    const short = shortTaskIds(await index.taskKeys(a), a)
+    expect(short.get(childKey(a, 'd-12'))).toBe('slack:C0GENERAL:subsession:d-12')
+    expect(short.get(childKey(a, 'd-2'))).toBe('slack:C0GENERAL:subsession:d-2')
+    // `…:d-1` is also the start of `…:d-12`, so its short id would name both: it shows its whole key.
+    expect(short.get(childKey(a, 'd-1'))).toBe(childKey(a, 'd-1'))
+    for (const [key, shown] of short) expect(await index.resolve(a, shown)).toBe(key)
+  })
+
+  it('records what an open work task opened, once each, at most twenty', async () => {
+    const s = await open()
+    const a = agent()
+    const index = s.assistantSubsessions
+    const key = childKey(a, 'd-1')
+    const pull = (n: number) => ({
+      kind: 'pull request' as const,
+      label: `example-org/example-repo#${n}`,
+      url: `https://github.com/example-org/example-repo/pull/${n}`,
+      now: n
+    })
+    expect(await index.recordOpened(a, key, pull(1))).toBe(false)
+    await index.open(row(a, 'd-1'))
+    expect(await index.recordOpened(a, key, pull(1))).toBe(true)
+    expect(await index.recordOpened(a, key, pull(1))).toBe(false)
+    for (let n = 2; n <= 25; n++) await index.recordOpened(a, key, pull(n))
+    const opened = await index.opened(a, key)
+    expect(opened).toHaveLength(20)
+    expect(opened[0]).toEqual({
+      kind: 'pull request',
+      label: 'example-org/example-repo#1',
+      url: pull(1).url,
+      openedAt: 1
+    })
+    await openWatch(s, a, 'check-1', 1_000)
+    expect(await index.recordOpened(a, childKey(a, 'check-1'), pull(30))).toBe(false)
+  })
+})
+
+describe.skipIf(usingPostgresStore())('the v74 → v75 retained tasks on SQLite', () => {
+  it('adds when a task closed, what it was opened for and what it opened; an ended follow-up counts as closed', async () => {
+    const path = tempStorePath('ac-assistant-v74-')
+    await (await LocalStore.open(path)).close()
+    const a = agent()
+    const old = new DatabaseSync(path)
+    old.exec(`DROP TABLE assistant_task_opened;
+      ALTER TABLE assistant_subsession DROP COLUMN closedAt;
+      ALTER TABLE assistant_subsession DROP COLUMN openedForPlace;
+      ALTER TABLE assistant_subsession DROP COLUMN openedForMessage;
+      PRAGMA user_version = 74`)
+    for (const [sql, params] of V74_ROWS(a)) old.prepare(sql).run(...(params as never[]))
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    try {
+      await expectV75(upgraded, a)
+    } finally {
+      await upgraded.close()
+    }
+    const db = new DatabaseSync(path)
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    db.close()
+  })
+})
+
+describe.skipIf(!usingPostgresStore())('the v74 → v75 retained tasks on PostgreSQL', () => {
+  it('adds when a task closed, what it was opened for and what it opened; an ended follow-up counts as closed', async () => {
+    const databaseUrl = process.env.DATA_PLANE_TEST_DATABASE_URL!
+    const schema = `mig_${randomUUID().replace(/-/g, '')}`
+    const config = { version: 1 as const, databaseUrl, maxConnections: 2 }
+    const orgForAgent = (): string => 'org-a'
+    const admin = new pg.Client({ connectionString: databaseUrl })
+    await admin.connect()
+    const a = agent()
+    try {
+      const fresh = await PostgresAsyncDatabase.open(config, () => undefined, schema)
+      await fresh.finishSchemaInitialization()
+      await (await LocalStore.open({ database: fresh, shared: true, ownerId: 'm1', orgForAgent })).close()
+
+      await admin.query(`SET search_path TO ${schema}`)
+      await admin.query('DROP TABLE assistant_task_opened')
+      await admin.query(
+        'ALTER TABLE assistant_subsession DROP COLUMN closedAt, DROP COLUMN openedForPlace, DROP COLUMN openedForMessage'
+      )
+      for (const [sql, params] of V74_ROWS(a)) await admin.query(numbered(sql), params)
+      await admin.query('UPDATE _local_store_schema_version SET version = 74 WHERE singleton = true')
+
+      const database = await PostgresAsyncDatabase.open(config, () => undefined, schema)
+      await database.finishSchemaInitialization()
+      const upgraded = await LocalStore.open({ database, shared: true, ownerId: 'm2', orgForAgent })
+      try {
+        await expectV75(upgraded, a)
+      } finally {
+        await upgraded.close()
+      }
+      const version = await admin.query('SELECT version FROM _local_store_schema_version')
+      expect(Number(version.rows[0].version)).toBe(SCHEMA_VERSION)
+    } finally {
+      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => undefined)
+      await admin.end()
+    }
+  })
+})
+
+/** `?` placeholders as PostgreSQL's numbered ones. */
+const numbered = (sql: string): string => {
+  let n = 0
+  return sql.replace(/\?/g, () => `$${++n}`)
+}
+
+/** What a v74 daemon left: a work task, an ended and an open follow-up, and a getting-to-know task's unscheduled watch row. */
+const V74_ROWS = (a: string): Array<[string, unknown[]]> => [
+  [
+    `INSERT INTO assistant_subsession (agentId, childSessionKey, parentSessionId, parentSessionKey, state, createdAt, mode, changedAt)
+     VALUES (?, ?, 'sid-parent-1', 'parent', 'done', 1000, 'work', 1000)`,
+    [a, childKey(a, 'work')]
+  ],
+  ...(['done', 'active'] as const).map((status, n): [string, unknown[]] => [
+    `INSERT INTO assistant_subsession (agentId, childSessionKey, parentSessionId, parentSessionKey, state, createdAt, mode,
+       changedAt, watchStatus, originPlatform, originChannel, originTransportScope, title, updatedAt)
+     VALUES (?, ?, 'sid-parent-1', 'parent', 'done', 1000, 'watch', 1000, ?, 'slack', 'C0GENERAL', 'T0EXAMPLE', 'Watch', ?)`,
+    [a, childKey(a, `check-${n}`), status, 7_000 + n]
+  ]),
+  [
+    `INSERT INTO assistant_subsession (agentId, childSessionKey, parentSessionId, parentSessionKey, state, createdAt, mode,
+       changedAt, originPlatform, originChannel, originTransportScope)
+     VALUES (?, ?, 'sid-parent-1', 'parent', 'done', 1000, 'watch', 1000, 'slack', 'C0GENERAL', 'T0EXAMPLE')`,
+    [a, childKey(a, 'check-look-1')]
+  ]
+]
+
+async function expectV75(s: LocalStore, a: string): Promise<void> {
+  const index = s.assistantSubsessions
+  expect(await index.record(a, childKey(a, 'work'))).not.toHaveProperty('closedAt')
+  expect(await index.record(a, childKey(a, 'check-0'))).toMatchObject({ watchStatus: 'done', closedAt: 7_000 })
+  expect(await index.record(a, childKey(a, 'check-1'))).not.toHaveProperty('closedAt')
+  expect(await index.record(a, childKey(a, 'check-1'))).not.toHaveProperty('gettingToKnow')
+  expect(await index.record(a, childKey(a, 'check-look-1'))).toMatchObject({ gettingToKnow: true })
+  expect(await index.record(a, childKey(a, 'check-look-1'))).not.toHaveProperty('closedAt')
+  expect(
+    await index.recordOpened(a, childKey(a, 'work'), {
+      kind: 'merge request',
+      label: 'group/project!3',
+      url: 'https://gitlab.example.test/group/project/-/merge_requests/3',
+      now: 8_000
+    })
+  ).toBe(true)
+  expect(await index.opened(a, childKey(a, 'work'))).toHaveLength(1)
+  const openedFor = { place: 'slack:C0GENERAL', messageId: 'msg-1700000000.000100' }
+  await index.open({ ...row(a, 'new'), openedFor })
+  expect(await index.taskOpenedFor(a, openedFor)).toBe(childKey(a, 'new'))
+  expect(await index.closeTask(a, childKey(a, 'work'), 9_000)).toBe(true)
+  expect(await index.record(a, childKey(a, 'work'))).toMatchObject({ closedAt: 9_000 })
+}
 
 describe.skipIf(usingPostgresStore())('the v70 → v72 task model on SQLite', () => {
   it('adds the columns and the thread table, titling each task from its session', async () => {
@@ -943,7 +1267,8 @@ describe.skipIf(usingPostgresStore())('the v43 → v44 failure report columns on
         parentSessionId: 'sid-parent-1',
         parentSessionKey: 'parent',
         state: 'open',
-        createdAt: 1_000
+        createdAt: 1_000,
+        changedAt: 1_000
       })
       expect(await upgraded.assistantSubsessions.claimReport(a, childKey(a, '1'), '{"text":"ended"}')).toBe(true)
       expect(await upgraded.assistantSubsessions.countReportAttempt(a, childKey(a, '1'))).toBe(1)
@@ -989,7 +1314,8 @@ describe.skipIf(!usingPostgresStore())('the v43 → v44 failure report columns o
           parentSessionId: 'sid-parent-1',
           parentSessionKey: 'parent',
           state: 'open',
-          createdAt: 1_000
+          createdAt: 1_000,
+          changedAt: 1_000
         })
         expect(await upgraded.assistantSubsessions.claimReport(a, childKey(a, '1'), '{"text":"ended"}')).toBe(true)
         expect(await upgraded.assistantSubsessions.countReportAttempt(a, childKey(a, '1'))).toBe(1)
@@ -1060,7 +1386,8 @@ describe.skipIf(!usingPostgresStore())('the v37 → v38 sub-session index on Pos
         agentId: a,
         title: 'Kept across the upgrade',
         origin: { platform: 'slack', channel: 'C0GENERAL', transportScope: null },
-        taskKey: 'slack:C0GENERAL:subsession:check-1:kept'
+        taskKey: 'slack:C0GENERAL:subsession:check-look-1:kept',
+        gettingToKnow: 'joined'
       })
       await first.close()
 

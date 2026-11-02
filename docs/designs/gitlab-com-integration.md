@@ -944,7 +944,10 @@ accidental bot-to-bot stays off while the bot's own merge requests remain
 reviewable through one deliberate exception, scoped to the rule's own
 identity: a same-project merge-request revision authored by the account this
 rule itself names still enters review, matching GitHub's internal-CI lane
-where the App's own same-repository pull requests are reviewed. Every other
+where the App's own same-repository pull requests are reviewed. A revision of
+such a merge request pushed by anyone else is not loop traffic: the Section
+12.2 gate authorizes that pusher instead of the author, since a bound account
+can never pass it. Every other
 member of the veto set stays vetoed even for merge-request revisions, so one
 agent's merge request never wakes a sibling agent's hook. Notes authored by
 any bound account and system-generated notes carrying AgentConnect status or
@@ -1240,6 +1243,15 @@ integration surface:
 
 Each operation has an allowlisted endpoint and method. The broker does not
 expose an arbitrary path, GraphQL query, request body, or bearer token.
+
+The `gitlab_effect` lease carries the clamp the broker enforces per entry. The
+workspace project earns `write` from a write workspace and `comment` from a
+read one. Another project earns the tier of the agent's explicit additional
+authorization on it, the same authority the Git plane honors (§13.1); the
+grant has already set the agent account's project role to match (§8.3). An
+enabled gitlab hook on the project raises that to at least `comment`, and is
+enough alone for `comment`; a live follow-up watch alone earns `read`.
+Anything else is refused.
 
 This broker surface is new machinery, not an existing seam: today's GitHub
 equivalents are the capability-clamped CLI token plus exactly two structured

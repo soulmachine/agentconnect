@@ -576,6 +576,10 @@ export class VirtualSlackConnection implements PlatformConnection {
     this.unmodelled('code channels')
   }
 
+  async archiveCodeChannel(): Promise<never> {
+    this.unmodelled('code channels')
+  }
+
   async closeCodeSession(): Promise<boolean> {
     this.unmodelled('code channels')
   }
@@ -583,8 +587,8 @@ export class VirtualSlackConnection implements PlatformConnection {
   // The Arena has no code channels, so no Plan tab exists to mirror the plan into.
   writePlanCanvas(): void {}
 
-  // Nor a channel for a coordinator's task, which stays in its message's thread.
-  async openTaskPlace(): Promise<undefined> {
+  // So every conversation threads off its root posts.
+  async roomThread(): Promise<undefined> {
     return undefined
   }
 

@@ -5,7 +5,7 @@
 > `session-mode-auto-v1` (§3.1); with the switch off it routes `auto` as Per thread and keeps P1's
 > task tools for every session (§5.1, §6.3). New rooms and group DMs start on Auto where the bot's
 > daemon reads it (§3.2), and assistant mode's places run through the coordinator (§3.4). On Slack a
-> task the coordinator opens for a message works in a code channel linked to it (§6.8). The
+> task moves into a code channel only when it makes one for its work (§6.8). The
 > coordinator's prompt and tool surface are the ones the local runtime matrix validates (§12).
 > Builds on: [channel-session-mode.md](channel-session-mode.md) (the reserved `auto` value),
 > [assistant-mode.md](assistant-mode.md) §5.6 (delegated tasks),
@@ -36,7 +36,9 @@ Single session keeps its current meaning: root and thread messages all join one 
 | Background task     | A task with no thread; only its parent talks to it, and it reports to the parent at the end of each round                                |
 | Owned thread        | A thread attached to a task that still exists                                                                                            |
 
-Assistant mode's follow-ups and approved proposals stay the other kinds of task, unchanged.
+A task runs in **work** mode, as every task above does, or in **watch** mode: assistant mode's
+follow-ups, read-only and checked on a schedule ([assistant-mode.md](assistant-mode.md) §5.18 ⑤).
+Approved proposals stay a kind of their own.
 
 ## 3. Mode and configuration
 
@@ -100,9 +102,22 @@ Assistant mode's follow-ups and approved proposals stay the other kinds of task,
   which posts in the report's thread or at the conversation's root; a report never opens a task and
   is never handed to one, and shows no 🤔. Its own follow-ups and proposals, made with the place
   tools of §5.4, belong to it as they belong to an `append` session.
-- A report queued behind a running turn is never absorbed into the next batch. It starts a turn of its
-  own, which keeps the report's own metadata (a getting-to-know report's proposals ride on it); the
-  channel messages queued behind it join that turn.
+- A report queued behind a running turn joins the next batch in arrival order, beside the channel
+  messages and framed apart from them as `<report id task kind title>`: the task it speaks for by
+  its `taskId`, kind and title, or `kind="agent answer"` for another agent's answer
+  ([assistant-mode.md](assistant-mode.md) §5.18 ④). It brings no asker and no permission class, so it
+  rides with the batch it arrives in, and a batch of reports alone is judged `NOBODY` (§5.18 ③). The
+  coordinator answers it with `replyToMessage` naming its id, or leaves it, which settles it
+  silently with the turn; nothing is retried or queued again.
+- A report that carries turn metadata keeps a turn of its own, ending the batch before it: a
+  getting-to-know report, whose proposals ride on that turn's metadata, and a report that opens its
+  place's long session. The channel messages right behind it of one permission class join its turn,
+  and it adds no asker. A report that finds the coordinator idle starts a turn at once, and a webchat
+  conversation's reports, like its messages, each run as a turn of their own (§10).
+- The coordinator's turns carry the work board ([assistant-mode.md](assistant-mode.md) §5.18 ② and ④)
+  instead of the standing follow-up list and the running-tasks block: its place's open tasks with
+  their ids, and the other places' open tasks every person in its batch may read. It is sent when the
+  session opens, when its text changed, after a compaction and after a restart.
 
 ### 3.5 Switching
 
@@ -130,29 +145,36 @@ Assistant mode's follow-ups and approved proposals stay the other kinds of task,
 
 ### 4.2 Four outcomes
 
-| Outcome                  | How                                                                                                                                                                                                |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| (a) Hand to an open task | `messageTask {taskId, messageId}`: the message's thread is attached to that task, which answers there                                                                                              |
-| (b) Open a new task      | `delegateTask {messageId, title}`: a new task opens for the message, with its thread attached                                                                                                      |
-| (c) Ignore               | No call for the message; a one-message turn may also answer `AC_NO_RESPONSE` (`packages/daemon/src/session/no-response.ts`)                                                                        |
-| (d) Reply directly       | `replyToMessage {messageId, message}`, posted in the message's thread as today; a one-message turn may also just answer in text. The thread stays unowned, so replies come back to the coordinator |
+| Outcome                  | How                                                                                                                                               |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (a) Hand to an open task | `messageTask {taskId, messageId}`: the message's thread is attached to that task, which answers there                                             |
+| (b) Open a new task      | `delegateTask {messageId, title}`: a new task opens for the message, with its thread attached                                                     |
+| (c) Ignore               | No call for the message                                                                                                                           |
+| (d) Reply directly       | `replyToMessage {messageId, message}`, posted in the message's thread as today. The thread stays unowned, so replies come back to the coordinator |
 
 (d) is for what needs no session of its own: greetings, thanks, a question about a task's status.
 
 ### 4.3 Batching
 
 The coordinator runs one turn at a time. Root messages that arrive while it runs are delivered
-together in its next turn, and it decides each one separately. Queued messages are never dropped.
+together in its next turn, with the reports that arrived among them (§3.4), and it decides each one
+separately. Queued messages are never dropped.
+A batch holds one permission class, so the queue is cut in arrival order where the next sender's
+class differs, and every sender of a batch is asked on its turn
+([assistant-mode.md](assistant-mode.md) §5.18 ③).
 
-A turn's final text cannot be tied to one of several messages, so in a turn with more than one
-message every outcome is a call that names its message:
+Every outcome is a call that names its message, in a turn of one message as in a batch, whose final
+text could not be tied to one of its messages:
 
 - (a) `messageTask`, (b) `delegateTask`, (d) `replyToMessage`, at most one per message.
 - A message with no call is ignored (c); no `AC_NO_RESPONSE` is needed.
-- The turn's final text is not posted; it is kept only in the coordinator's transcript.
-
-A one-message turn may use either form: text equals `replyToMessage`, `AC_NO_RESPONSE` equals
-ignoring it.
+- The turn's final text is not posted; it is kept only in the coordinator's transcript. The prompt
+  says so, and the delivery boundary enforces it whatever the text says: prose, the sentinel, or
+  prose that ends in the sentinel. A report turn and a channel message turn alike post only through
+  their calls. A one-message turn once answered with its text; a model told its text is never shown
+  wrote its reasons there, and they were posted.
+- Webchat is the exception (§10): its browser shows the text as it streams, so there a one-message
+  turn's text is its reply.
 
 Ignoring is silent. The prompt forbids a reply that only says a message is not for the agent; the
 runtime matrix caught one model posting exactly that (§12).
@@ -172,8 +194,8 @@ morning all
 The id is the platform message id behind a `msg-` prefix. A bare Slack timestamp reads as a number,
 and some models pass it as one, which drops its trailing zeros (§12).
 
-A message that mentions the agent and has no outcome when the turn ends (a one-message turn's
-`AC_NO_RESPONSE` included) takes the fallback of §4.5: a task opens for it.
+A message that mentions the agent and has no outcome when the turn ends (a turn that answers it in
+text alone included) takes the fallback of §4.5: a task opens for it.
 
 ### 4.4 Feedback
 
@@ -192,7 +214,7 @@ A message that mentions the agent and has no outcome when the turn ends (a one-m
 When the coordinator's turn fails or times out:
 
 - A message that mentions the agent opens a threaded task directly, as Per thread would, in the
-  message's thread: a fallback never opens a conversation of its own (§6.8).
+  message's thread: a fallback task holds no channel (§6.8; not enforced yet, see its "As shipped").
 - Any other message stays silent.
 
 ### 4.6 Usage
@@ -209,9 +231,8 @@ The existing names stay, with `messageId` added (`SEND_MESSAGE_ACTIONS` in
 
 - `delegateTask {title, message?, messageId?}`: `message` or `messageId` is required.
   - With `messageId`: a threaded task. It receives the original message as it arrived (sender, text,
-    attachments); `message` is the coordinator's background. Where the message's platform gives a task a
-    conversation of its own (a Slack code channel), the task works there instead of in the message's
-    thread (§6.8).
+    attachments); `message` is the coordinator's background. It works in the message's thread; a
+    task that makes a Slack code channel for its work moves into it (§6.8).
   - Without: a background task, as today. The coordinator's tool always names a message, so its tasks
     are always threaded (§6.6).
   - `title` is required and shown in the console and in `listTasks`.
@@ -246,18 +267,39 @@ tasks, follow-ups and approved proposals included, and at most the 20 most recen
 tasks. An assistant-mode place's session that is not a coordinator lists with it only its
 follow-ups, research and approved proposals. Each entry: id, title, whether a thread is attached,
 thread links, owner, last activity, whether it is running, and the task's summary with its update
-time (§6.7). The coordinator uses it to place a new message and to
+time (§6.7); a follow-up, a task in watch mode, also its next check. The coordinator uses it to place a new message and to
 answer "how is that going".
+
+The coordinator's `listTasks {after?}` reads the work board ([assistant-mode.md](assistant-mode.md)
+§5.18 ④): `here`, its own open tasks with the fields above, and `elsewhere`, the other places' open
+tasks its batch may see, read only, with place, status, summary and thread links. A `here` entry also
+carries its status as the board shows it: a follow-up's is `next <time>` while it waits and `running`
+during a check. Each is a page of
+at most 20 in the board's order, newest change first, continued by its own `nextCursor`, and access
+is judged again on every page. Every entry also names the message its task was opened for and the pull
+or merge requests it opened. Both lists hold open tasks only; a task's id is its key cut before the
+agent's id where that names it alone, which every task tool takes beside the whole key.
+
+`readTask {taskId, after?}` is offered wherever `listTasks` is. It reads one task, open or closed
+within its window (§6.5), without waking it: its title, summary and `summaryAt`, mode and status, the
+message it was opened for, the pull requests it opened with the follow-ups watching them, and a page
+of its latest words, continued by a cursor. It is judged like `recall` of the task's place, with the
+task's own sessions, for every person in the batch, on every page; a task they may not read is
+answered as an unknown id ([assistant-mode.md](assistant-mode.md) §5.18 ④).
 
 ### 5.3 `updateTask`
 
 `updateTask {summary, title?}`, a tool of its own. `summary` is required; the title changes only
-together with the summary. Only a task calls it, for itself; both kinds can.
+together with the summary. Only a task calls it, for itself; both kinds can, and so can a follow-up's
+check, to rename what it watches (§6.7). Its description says the title names what the task is doing
+now and the summary's first sentence states the current status.
 
 ### 5.4 The coordinator's limits
 
 - Only AgentConnect tools: `sendMessage` (the task actions and `replyToMessage`, plus `postMessage`
-  and `callAgent`), `listTasks`, memory, and assistant mode's follow-up tools.
+  and `callAgent`), `listTasks`, `readTask`, `recall`, memory, and assistant mode's follow-up tools.
+  - `recall` keeps its parameters and the read rule, judged by every sender of the batch. Each excerpt
+    carries its message id and, where the batch may read it, the task the message was handed to.
   - `postMessage` and `callAgent` run as they do in any session. `callAgent` always asks for an
     answer, which comes back as a report.
   - The place tools are those its place's long session is offered: `followUp`, `getToKnow`, `propose`,
@@ -267,6 +309,10 @@ together with the summary. Only a task calls it, for itself; both kinds can.
     sender and answer in its thread; a report or an unknown id is refused.
 - A read-only runtime mode and no workspace (an empty directory). Anything that needs work becomes a
   task.
+  - Where that mode is a plan mode, the tools that end a plan wait for an approver nobody is, so the
+    coordinator is never offered them (Claude Code's `ExitPlanMode` and `AskUserQuestion`, as for a
+    check). Its prompt says the mode restricts native file and shell tools only, never its
+    AgentConnect tools.
   - Its workspace isolation is always shared, so it never gets a checkout, a session pod or an
     executor of its own.
   - On the daemon's disk a coordinator on the agent's shared host opens in
@@ -284,22 +330,23 @@ together with the summary. Only a task calls it, for itself; both kinds can.
 ### 6.1 Storage
 
 Tasks live in the existing persistent parent–child index
-(`packages/daemon/src/store/assistant-subsessions.ts`, where follow-ups already sit under `kind`),
-which gains a title, a summary and attached threads. The thread-to-task attachment can extend the
+(`packages/daemon/src/store/assistant-subsessions.ts`), which gains a title, a summary and attached
+threads. A row's `mode` tells a task in work mode from a follow-up in watch mode, which keeps its
+schedule (`nextAt`) on the same row ([assistant-mode.md](assistant-mode.md) §5.18 ⑤). The thread-to-task attachment can extend the
 thread participation record of [channel-session-mode.md](channel-session-mode.md) §6.4.
 
 ### 6.2 The two kinds
 
 The rules follow from whether a thread is attached; there is no separate switch.
 
-| Aspect           | Threaded task                                                   | Background task                                |
-| ---------------- | --------------------------------------------------------------- | ---------------------------------------------- |
-| Coordinate       | Platform threads, one or more, or a room of its own (§6.8)      | `subsession:<id>`, never posts to the platform |
-| Who talks to it  | Anyone in its threads; the parent through `messageTask`         | The parent only                                |
-| Where results go | Into the thread; nothing is reported to the parent              | Reported to the parent each round (today)      |
-| Permission cards | In its own thread                                               | As today                                       |
-| Concurrency cap  | Not counted in `maxConcurrentSubsessions`                       | Counted                                        |
-| Owner            | The sender of the message it opened for; later messages keep it | The parent's owner                             |
+| Aspect           | Threaded task                                                                        | Background task                                |
+| ---------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------- |
+| Coordinate       | Platform threads, one or more, or a room of its own (§6.8)                           | `subsession:<id>`, never posts to the platform |
+| Who talks to it  | Anyone in its threads; the parent through `messageTask`                              | The parent only                                |
+| Where results go | Into its threads; a run ended in a channel it holds is reported to the parent (§6.8) | Reported to the parent each round (today)      |
+| Permission cards | In its own thread                                                                    | As today                                       |
+| Concurrency cap  | Not counted in `maxConcurrentSubsessions`                                            | Counted                                        |
+| Owner            | The sender of the message it opened for; later messages keep it                      | The parent's owner                             |
 
 Both kinds inherit the parent's visibility and refuse changes to it.
 
@@ -332,7 +379,10 @@ coordinate is unchanged, [channel-session-mode.md](channel-session-mode.md) §3.
 
 A threaded task lives as long as its session: when the session ages out after 7 idle days, the task
 closes and leaves `listTasks`. A later reply in its thread is an unowned-thread message and goes to
-the coordinator, which may open a task again.
+the coordinator, which may open a task again, under the same id. A follow-up lives until it is done or
+stopped, however long it waits between checks. A closed task of either kind keeps its row, marked
+closed, which `readTask` reads and nothing else lists; the store's retention sweep deletes it 90 days
+after it closed.
 
 ### 6.6 Coordinator tasks are threaded
 
@@ -346,66 +396,148 @@ coordinator opens no background task, so no task of the coordinator ever changes
 A task keeps its own summary with `updateTask` (§5.3), which the coordinator reads in `listTasks` to
 place new messages.
 
-- **Content**: fixed parts set by the task's prompt, at most 500 characters: the scope (what the task
-  is about, the coordinator's main signal), the status (in progress, waiting on someone, done or
-  blocked), and the next step and open questions.
+- **Content**: fixed parts set by the task's prompt, at most 500 characters: the status (in progress,
+  waiting on someone, done or blocked) in a first sentence that stands on its own, since a short list
+  may quote only that sentence, then the scope (what the task is about, the coordinator's main
+  signal), and the next step and open questions.
 - **When**: the prompt asks for an update in any turn where the scope or status changes. As a
   backstop the daemon adds a reminder to the next turn when a task has no summary or its summary is
   5 turns old. No extra model call writes summaries.
 - **Before the first summary**: `listTasks` shows the title and background the coordinator gave
   (`delegateTask`'s `message`).
-- **Title**: the task may change it with the summary; the coordinator's title is only the first one.
+- **Title**: it names what the task is doing now. The task changes it with the summary when the work
+  moves on to something it no longer names, and the stale-summary reminder says so; the coordinator's
+  title is only the first one. A new title changes the work board.
+- **A follow-up**: its summary is its last check's result, which `recordCheck` writes, and before its
+  first check `listTasks` shows what it was taken with. Its title names what it watches; a check that
+  a message moved to something else renames it with `updateTask`. It gets no stale-summary reminder.
 - **Storage**: the summary is conversation content, so the Control Plane does not store it. It lives
   in the daemon's task index (§6.1), and the console's Tasks tab reads it through the BFF from the
   owning daemon, as transcript reads work.
 
 ### 6.8 A task in a conversation of its own
 
-On Slack, a task the coordinator opens for a message works in a native code channel linked to that
-message ([slack-code-channels.md](slack-code-channels.md)) instead of in the message's thread.
+A task the coordinator opens for a message works in the message's thread on every platform (§6.4).
+On Slack it may move into a native code channel ([slack-code-channels.md](slack-code-channels.md)),
+but only when it makes one for its work: the coordinator never asks the platform for a place. Until
+the eighty-seventh revision of [assistant-mode.md](assistant-mode.md) the coordinator opened a code
+channel for every delegated message, which made a channel of each small request and left the asking
+thread with a link and no answer, since a task in a place reported nothing. The thread is the asker's
+place; a channel is a workspace the task earns.
 
-- **Creation.** `delegateTask` with a `messageId` asks the message's platform for a place, through the
-  optional `openTaskPlace` member of the daemon platform contract (`platforms/contract.ts`). Slack
-  implements it with the code channel creation path its `createSlackCodeChannel` tool uses: linked to
-  the message, keyed by it so a retried creation finds the same channel, privacy matching the message's
-  conversation, and its author invited. The daemon asks only for a sender who may have the agent make
-  something new (a full member of the bot's workspace, the place write rule's `new` target).
-- **Coordinate.** The task's session is the channel's one session (`slack:<channel>:<channel>`), and the
-  task holds the channel coordinate as its one thread from its first round: it reports nothing and is
-  outside the concurrency cap (§6.2). The message's own thread stays unowned, and the coordinator posts
-  a link to the channel there ("Started a task: [title](link)").
-- **The first message.** Slack copies the message into the new channel, and that copy opens the task: it
-  reaches the task's session, never a second one, and the daemon dispatches nothing itself. A message in a
-  room keyed as one thread that arrives while the agent's place is still being made waits for it, at most
-  30 seconds, so the copy runs once the task is indexed. The copy, the first message there from the
-  original's sender within 10 minutes, carries the coordinator's title and background; no other message
-  takes them, nor a message the coordinator moves there.
+- **Creation.** The task calls its `createSlackCodeChannel` tool, as any Slack session may, when the
+  work it was handed is the kind that wants a channel (several steps, edits, tests or a pull request,
+  in the tool's own words) and the person did not ask it to stay in the thread; a quick answer never
+  makes one. The tool's rules are unchanged: linked to the message the task is working on, keyed by it
+  so a retried creation finds the same channel, privacy matching the message's conversation, its author
+  invited, and open only to a sender who may have the agent make something new (a full member of the
+  bot's workspace, the place write rule's `new` target). The `openTaskPlace` member leaves the daemon
+  platform contract (`platforms/contract.ts`): `delegateTask` has no place to ask for.
+- **Coordinate.** The task keeps its session. The channel becomes one more thread it holds
+  (`slack:<channel>:<channel>`, attached as §6.4 attaches a thread), so a message in the channel
+  reaches the task and is answered there, while the origin thread stays attached and is answered in
+  place. The task's own words tell the thread where it moved; the coordinator posts nothing.
+- **The first message.** Slack copies the linked message into the new channel. The copy reaches the
+  task through the channel it holds, never a second session, and carries nothing new: the task already
+  has the message, its title and its background. The daemon dispatches nothing itself. A message in a
+  room keyed as one thread that arrives while the task's channel is still being attached waits for it,
+  at most 30 seconds.
+- **Not a place.** A channel a task holds is the task's workspace, not a place of its own: it is never
+  onboarded (no getting-to-know task, no long session of its own, no coordinator), and a follow-up
+  taken from a message there belongs to the task's own place, the conversation the task was opened
+  in, where its reports and its board line go. A code channel made outside a task is unchanged here.
 - **Routing.** A room its platform keys as one thread named after itself has no root, so it never runs a
   coordinator of its own whatever its mode: every message there keys on the channel's session, the
   task's while a task holds it. This also keeps a code channel made outside a task, or one whose task has
   closed, an ordinary code channel. `!new`, `!stop` and Slack's native Stop act on that session (§8).
-- **More messages.** `messageTask` with a `messageId` moves the message into the channel, where the task
-  answers, and links the channel in the message's thread ("Passed to [title](link)"); the thread is not
-  attached, so a later reply there comes back to the coordinator. `listTasks` lists the task with the
-  channel as its thread and the channel's link.
-- **Closing.** Archiving the channel, by a person or by the agent, closes the task: its row and thread go,
-  and its owner is cleared (§6.2). The relay forwards an archive with an `archived` flag, since a native
-  Stop reaches the same channel coordinate. The task also closes after 7 idle days (§6.5) and is released
-  when its coordinator's conversation leaves `auto` (§3.5), judged by that conversation, not the
-  channel's own mode.
+  A message in a room a task holds passes the session source gate
+  ([session-visibility.md](session-visibility.md) §4.1) as the task's own: it is judged as the
+  conversation of the task's session, whose row keeps its binding to the origin.
+- **More messages.** `messageTask` with a `messageId` moves the message into the channel a task holds,
+  where the task answers, and links the channel in the message's thread ("Passed to [title](link)"); the
+  thread is not attached, so a later reply there comes back to the coordinator. `listTasks` lists the
+  task with the channel among its threads and the channel's link.
+- **Reports.** A task whose answer lands where the asker's thread is not reports to its coordinator: a
+  background task each round (§6.6), and a task holding a channel at the end of each run there, with the
+  `<report id task kind title>` of [assistant-mode.md](assistant-mode.md) §5.18 ④ carrying the run's
+  final output, delivered on its behalf, with its summary as a supplement. A summary is the task's own
+  account of itself and is stale whenever the task did not update it as it finished, so the report
+  carries what the run produced, as a background task's round report carries the round's output.
+  The coordinator may relay it in the origin thread with `replyToMessage`, so "tell me when it is done"
+  is answered where it was asked, or leave it. A task answering in the asker's own thread reports
+  nothing, as before. A task running in the channel may also tell its origin thread itself with
+  `postMessage`, since its turn's own reply goes to the channel: `sendMessage` refuses only the thread
+  the turn is delivering to as the conversation it already answers, not the thread the session is
+  keyed on. Such a post seeds no session, the task's own being that thread's.
+- **Closing.** Archiving the channel, by a person or by the agent, closes the task: its threads go, its
+  row is kept closed (§6.5), and its owner is cleared (§6.2). The relay forwards an archive with an
+  `archived` flag, since a native Stop reaches the same channel coordinate. The task also closes after
+  7 idle days (§6.5) and is released when its coordinator's conversation leaves `auto` (§3.5), judged
+  by that conversation, not the channel's own mode.
 - **Fallback.** When the installation lacks code channels, creation fails, or the sender may not make a
-  channel, the task opens in the message's thread as before; nothing beyond the usual answer is shown.
-- **Not here.** A background task (`delegateTask` without a `messageId`) never gets a conversation of its
-  own, and neither does a fallback task (§4.5) or a thread session adopted on a switch into `auto`
-  (§3.5).
+  channel, the task stays in its threads; nothing beyond the tool's own answer is shown.
+- **Not here.** A background task (`delegateTask` without a `messageId`) never holds a channel, and
+  neither does a fallback task (§4.5; not enforced yet, see "As shipped") or a thread session adopted
+  on a switch into `auto` (§3.5). The coordinator asking for a channel on `delegateTask` (a `place` parameter) is not done: the task that
+  has the work decides.
+
+**As shipped** (2026-11-02, #3567). Choices the text above leaves open:
+
+- **One session in two conversations.** A message carries the channel of its session beside its
+  thread (`sessionChannel`, read through `sessionChannelOf` beside `sessionThreadOf` wherever a session
+  key, an inbox lane, a gate or a mute is built), so a message in a channel a task holds keys on the task's session in the
+  origin conversation and is delivered, answered and recorded in the channel. Routing looks a room
+  keyed as one thread up among the agent's held threads before it reads the room's mode, and a
+  command typed there (`!new`, `!stop`, `!queue`) acts on the task's session the same way. A message
+  is steered into a running turn only when that turn answers in the message's own channel, so a
+  message in the channel waits for a turn of its own there rather than being answered in the origin
+  thread, and the reverse.
+- **The attach.** `createSlackCodeChannel` hands the channel it made to the daemon through the
+  session tool environment (`makeRoom`), never through the platform contract, and the daemon attaches
+  it to the calling session's task when that task was opened for a message; a thread session adopted
+  on a switch into `auto` was opened for none, so its channel keeps its own session as outside a
+  task. A channel the tool finds the origin already in is not attached again. The wait is per agent:
+  a message in any room keyed as one thread waits while one of the agent's rooms is being attached.
+- **Not a place.** A join of the agent's bot to a channel a task holds takes no getting-to-know task
+  and no introduction on join; the join waits, as a message does, while the channel is being
+  attached. `gettingToKnowPlaceRefusal` refuses such a channel (`task-workspace`), so a getting-to-know
+  task taken for it before the attach landed ends unread, and a report that would open the place's
+  long session opens none there: no coordinator or appending session is minted for it. A follow-up
+  taken in a run there gets the task's place, as every tool of the task's session does
+  (`placeOfSession`), and replies in the thread the task holds there, the one it was opened in.
+- **A fallback task.** The task index does not tell a fallback task from a delegated one: both are
+  tasks opened for a message, so a fallback task holds a channel it makes like any other. The "Not
+  here" item above is narrower than the daemon here.
+- **The report.** It is sent when a turn delivered in a channel the task holds ends, completed or
+  failed, and no message of the task's waits behind it; a turn stopped there reports nothing. It
+  opens with `[task run] Task "<title>" ended a run in its channel (<link>).` and carries the last
+  turn's final output, delivered on the task's behalf, or says that the run ended without one or
+  stopped there before finishing; then `Its summary: <summary>` follows on one line when the task has
+  written one. The final output is the one a background round's report takes, the turn's reply with
+  nothing interrupted and no sentinel, uncapped, so the report costs the coordinator's next turn the
+  output once per run. It rides as any report does, one per run and answered in the thread the task
+  was opened in. A report the coordinator does not admit is logged, not retried. The task's standing
+  instructions say that the coordinator gets its summary at the end of each run there, so it keeps
+  that summary current.
+- **The tools in the channel.** The Slack tools that default to "this conversation"
+  (`setSlackCodeView`, `manageSlackCodeChannel`, `presentSlackReport`) and `getCurrentChannel` act in
+  the channel of the turn, and the code channel's native session controls follow the turn there.
+  The automatic Code diff is published from a turn delivered in the channel, against the starting
+  point the task kept on its first turn, in its origin thread, so work done before the channel was
+  made is part of it; a task whose repository already had changes then keeps none, as anywhere.
+  The channel's Tasks tab reads a session keyed on the channel, so it stays empty for a task that
+  holds it, and the code channel's standing context is not added to a task whose session opened
+  elsewhere.
+- **Earlier tasks.** A task the coordinator opened in a code channel before this change keeps the
+  channel's session as its own and routes as before; nothing migrates.
 
 ## 7. Thread routing
 
-| Thread                     | Goes to                                                     |
-| -------------------------- | ----------------------------------------------------------- |
-| Attached to a task         | That task, without the coordinator                          |
-| Unowned                    | The coordinator, which may still open a task for the thread |
-| A room keyed as one thread | That room's one session, the task's in its place (§6.8)     |
+| Thread                     | Goes to                                                          |
+| -------------------------- | ---------------------------------------------------------------- |
+| Attached to a task         | That task, without the coordinator                               |
+| Unowned                    | The coordinator, which may still open a task for the thread      |
+| A room keyed as one thread | That room's one session, the task's while a task holds it (§6.8) |
 
 ## 8. Commands
 
@@ -493,13 +625,19 @@ not addressed to this agent. Cost grows with the number of agents.
 
 ## 12. Validation
 
-`packages/daemon/test/acp-matrix/coordinator-probe.ts` injects a candidate coordinator prompt and
-tool surface (`sendMessage` with `delegateTask`, `messageTask` and `replyToMessage`, plus `listTasks`)
-into a real runtime session over an HTTP MCP fixture, delivers channel messages in the format of
-§4.3, and judges each message's outcome. Its scenarios: new work, a message for an open task, a
-status question, a greeting, chatter between people, a request to another agent, a vague mention, a
-small edit the coordinator must not do itself, two mixed batches, a follow-up's report (§3.4), and in
-a webchat conversation (§10) new work, a status question and a message for an open task.
+`packages/daemon/test/acp-matrix/coordinator-probe.ts` injects a candidate coordinator prompt and tool
+surface (`sendMessage` with `delegateTask`, `messageTask` and `replyToMessage`, `listTasks` with
+its `here` and `elsewhere` lists, and `readTask`) into a real runtime session over an HTTP MCP fixture, opens each
+turn with the work board the daemon would send ([assistant-mode.md](assistant-mode.md) §5.18),
+delivers channel messages in the format of §4.3, and judges each message's outcome. Its scenarios:
+new work, a message for an open task, a status question, a greeting, chatter between people, a
+request to another agent, a vague mention, a small edit the coordinator must not do itself, two mixed
+batches, a follow-up's report (§3.4), a batch of one message and two reports, one worth telling
+and one with nothing new, a request for work another channel's task already has open, a question
+about another channel's task that only its latest words answer, a run report from a task holding
+its code channel (§6.8), and
+in a webchat conversation (§10) new work, a status question, a message for an open task and a status
+question about another channel's task.
 
 ```bash
 AC_RUNTIME_MATRIX_ONLY=coordinator AC_RUNTIME_MATRIX_TARGETS=claude-acp,codex-acp \
@@ -528,9 +666,57 @@ an `ignore-chatter` turn that timed out after 180 s with no call; that scenario 
 On 2026-10-31 the webchat form of the prompt (§10) passed its three scenarios (`webchat-new-work`,
 `webchat-status`, `webchat-route`, which also fail any text shown beside a call) 9 / 9 on `claude-acp`
 and on `codex-acp` (3 repetitions each); the channel prompt was unchanged.
+On 2026-11-01, with the work board (assistant-mode.md §5.18), every scenario opened with the board
+the daemon sends and `listTasks` answered `here` and `elsewhere`; two scenarios were added:
+`elsewhere-duplicate`, a request at the channel root for work another channel's task has open, and
+`webchat-elsewhere-status`, a status question about that task in a member's webchat conversation.
+`claude-acp` (on Claude Opus 5.5) and `codex-acp` each passed 48 / 48 (3 repetitions each). Every
+new scenario was answered from the task's `elsewhere` summary after one `listTasks` call, naming its
+channel and pull request; no second task was opened and no task from elsewhere was messaged.
+`claude-acp` used only `ToolSearch` besides the coordinator tools, and `codex-acp` nothing else.
+The same day, with reports riding in the batch ([assistant-mode.md](assistant-mode.md) §5.18 ④),
+every report block naming its task by `task`, `kind` and `title`, and the prompt saying a report may
+arrive beside messages and is left silently, `report-batch` was added: a follow-up's report worth
+telling, a request for new work and a follow-up's report with nothing new, in one turn.
+`claude-acp` (on Claude Opus 5.5) and `codex-acp` each passed 51 / 51 (3 repetitions each). In every
+`report-batch` run the first report was relayed with `replyToMessage` naming its PR, the request
+was delegated and the empty report was left; `codex-acp` called `listTasks` once first, `claude-acp`
+did not. Neither used a tool besides the coordinator tools other than `claude-acp`'s `ToolSearch`.
+The same day, with follow-ups as watch tasks ([assistant-mode.md](assistant-mode.md) §5.18 ⑤), the
+prompt gained one paragraph: a task runs in one of two modes, work or watch, both messaged and
+stopped by their `taskId`, and a follow-up shows "next" and the time of its next check, or "running"
+while a check runs. No scenario was added. `claude-acp` (on Claude Opus 5.5) and `codex-acp` each
+passed 51 / 51 again (3 repetitions each), on the prompt with the reports of phase D. In every
+`report-reply` and `report-batch` run the follow-up's report was relayed with `replyToMessage` naming
+its PR, and the request beside it was delegated. Over the 51 runs `claude-acp` called `listTasks` 31
+times and `codex-acp` 39 times; neither used a tool besides the coordinator tools other than
+`claude-acp`'s `ToolSearch`.
+On 2026-11-02, with `readTask`, the inlined ids and the title as a task's current scope
+([assistant-mode.md](assistant-mode.md) §5.18 ④), the tool surface gained `readTask`, the board's
+header named it, and the prompt said that `readTask` reads a task's latest words, the message it was
+opened for and the pull requests it opened without waking it, and that a title names what a task is
+doing now and a summary's first sentence its status. `elsewhere-read-task` was added: a request at the
+channel root for the pull request of another channel's task, whose `elsewhere` summary predates it, so
+only `readTask` names it. `claude-acp` (on Claude Opus 5.5) and `codex-acp` each passed 54 / 54
+(3 repetitions each). In every `elsewhere-read-task` run the coordinator called `listTasks` once, then
+`readTask` once with the id `elsewhere` gave, and replied with the pull request's link; neither called
+`readTask` in any other scenario. Over the 54 runs `claude-acp` called `listTasks` 32 times and
+`codex-acp` 42 times; neither used a tool besides the coordinator tools other than `claude-acp`'s
+`ToolSearch`.
+The same day, with a task making its own code channel (§6.8), no scenario expected a task to open in
+a place: the probe's `delegateTask` already opened its task in the message's thread. One scenario
+was added, `channel-task-report`: a run report from a task holding its code channel, whose summary
+says the pull request is ready and that the asker wanted to hear, to be relayed with
+`replyToMessage`. `claude-acp` (on Claude Opus 5.5) and `codex-acp` each passed 57 / 57 (3
+repetitions each), on an unchanged prompt. In every `channel-task-report` run the coordinator
+relayed the report with `replyToMessage`, addressed to the asker and naming the pull request,
+without calling `listTasks` first. Over the 57 runs `claude-acp` called `listTasks` 34 times and
+`codex-acp` 42 times, and each called `readTask` only in `elsewhere-read-task`; neither used a tool
+besides the coordinator tools other than `claude-acp`'s `ToolSearch`.
 
 The candidate prompt asks the coordinator to express every outcome as a call and to end its turn
-with `AC_NO_RESPONSE`; the judge still accepts a one-message turn's text as its reply (§4.3).
+with `AC_NO_RESPONSE`. The runs above judged a one-message turn's text as its reply; since the daemon
+posts no channel turn's text (§4.3), the judge counts it for a webchat turn only.
 
 Two findings changed the design. A bare Slack timestamp as the message id was passed as a number by
 `qoder`, losing its trailing zeros, so ids carry a `msg-` prefix (§4.3). `github-copilot-cli` posted

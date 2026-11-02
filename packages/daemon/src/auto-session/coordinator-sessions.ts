@@ -2,7 +2,6 @@
 import { z } from 'zod'
 import type { NormalizedMessage } from '../messages/normalized.js'
 import type { SessionContext } from '../mcp/ops/context.js'
-import type { TaskPlace } from '../platforms/contract.js'
 import { parseArgs, requiredString, ToolArgumentError } from '../mcp/ops/args.js'
 import { taskTitleField, TASK_TITLE_MAX_CHARS } from '../mcp/ops/send-message-actions.js'
 import { deriveTitle } from '../session/derive-title.js'
@@ -11,7 +10,7 @@ import { sessionKey, type LocalStore } from '../store/local-store.js'
 import { monotonicTs } from '../store/monotonic-ts.js'
 import { a2aCoordChannel } from '../cp/cp-collab-routes.js'
 import { isSubsessionCoordinate, subsessionCoordinate } from '../session/subsession-coordinate.js'
-import { coordinatorMessageId } from './coordinator-prompt.js'
+import { coordinatorMessageId, type ReportAbout } from './coordinator-prompt.js'
 import {
   answerThreadOf,
   CoordinatorTurns,
@@ -25,11 +24,8 @@ import {
 /** A threaded task whose session has been idle this long closes, and its threads become unowned (auto-session-mode.md §6.5). */
 export const THREADED_TASK_IDLE_CLOSE_MS = 7 * 24 * 60 * 60_000
 
-/** How long a task's place waits for the platform's copy of its message to carry the coordinator's title and background (§6.8). */
-export const TASK_PLACE_OPENING_MS = 10 * 60_000
-const MAX_PLACE_OPENINGS = 1000
-/** How long a message in a room keyed as one thread waits for a place still being made, which may be its own (§6.8). */
-export const TASK_PLACE_CREATION_WAIT_MS = 30_000
+/** How long a message in a room keyed as one thread waits for a room a task is still attaching, which may be its own (§6.8). */
+export const TASK_ROOM_ATTACH_WAIT_MS = 30_000
 
 /** What the coordinator module needs from its daemon. */
 export interface CoordinatorSessionsHost {
@@ -45,13 +41,6 @@ export interface CoordinatorSessionsHost {
   sessionLink(sessionId: string): string
   /** Tell the Control Plane which session owns each of these tasks now, which locks a task's visibility (§6.2). */
   reportTaskOwners(agentId: string, keys: readonly string[]): Promise<void>
-  /** A conversation of its own for a task opened for this message, where its platform makes one (§6.8); undefined keeps the task in the thread. */
-  openTaskPlace?(
-    agentId: string,
-    integrationId: string | undefined,
-    msg: NormalizedMessage,
-    title: string
-  ): Promise<TaskPlace | undefined>
   /** Where a person opens a platform thread, where its platform links one. */
   threadLink?(
     integrationId: string | undefined,
@@ -116,14 +105,28 @@ export function messageForTask(
   }
 }
 
-/** The message a task in a conversation of its own receives (§6.8): the original, moved into that room, its thread there left behind. */
-export function messageForPlaceTask(
+/** A room keyed as one thread, as a task holds a channel it made (§6.8). */
+export interface TaskRoom {
+  channel: string
+  thread: string
+}
+
+/** The message a task holding a room receives when the coordinator moves one there (§6.8): the original, moved into the room and keyed on the task's session. */
+export function messageForRoomTask(
   msg: NormalizedMessage,
-  place: TaskPlace,
+  room: TaskRoom,
+  session: TaskRoom,
   opts: { background?: string }
 ): NormalizedMessage {
   const { replyThread: _reply, threadUrl: _link, isGroupDm: _group, ...moved } = messageForTask(msg, opts)
-  return { ...moved, channel: place.channel, thread: place.thread, isDm: false }
+  return {
+    ...moved,
+    channel: room.channel,
+    thread: room.thread,
+    isDm: false,
+    ...(session.channel !== room.channel ? { sessionChannel: session.channel } : {}),
+    ...(session.thread !== room.thread ? { sessionThread: session.thread } : {})
+  }
 }
 
 /** The message a task on its own page receives (§10): the original, moved to the task's coordinate and out of its conversation's posts. */
@@ -155,6 +158,12 @@ async function settledWithin(promises: readonly Promise<unknown>[], ms: number):
   clearTimeout(timer)
 }
 
+/** The message a task is opened for, as `recall` and `listTasks` name it (assistant-mode.md §5.18 ④). */
+const openedForOf = (message: DeliveredMessage) => ({
+  place: `${message.msg.platform}:${message.msg.channel}`,
+  messageId: message.id
+})
+
 // A link a title cannot break out of.
 const linkText = (title: string): string => title.replace(/[[\]\\]/g, (char) => `\\${char}`)
 
@@ -168,15 +177,8 @@ function taskTitleFrom(text: string | undefined, otherwise: string): string {
 /** The coordinator sessions of every `auto` conversation on this daemon, with their live turns. */
 export class CoordinatorSessions {
   readonly turns = new CoordinatorTurns()
-  /** Tasks whose place has not yet brought them their message, by session key, with what that message carries and who sent it (§6.8). */
-  private readonly placeOpenings = new Map<
-    string,
-    { title: string; background?: string; sender: string; until: number }
-  >()
-  /** Places being made per agent, until their task is indexed and its opening kept, which the platform's copy waits for (§6.8). */
-  private readonly placesInFlight = new Map<string, Set<Promise<void>>>()
-  /** Messages the coordinator moved into a place itself, which never take the place's opening. */
-  private readonly movedMessages = new WeakSet<NormalizedMessage>()
+  /** Rooms being made per agent, until the task making each holds it, which the platform's copy of its message waits for (§6.8). */
+  private readonly roomsInFlight = new Map<string, Set<Promise<void>>>()
 
   constructor(private readonly host: CoordinatorSessionsHost) {}
 
@@ -211,16 +213,12 @@ export class CoordinatorSessions {
       switch (call.action) {
         case 'delegateTask': {
           const owner = await this.taskOwner(ctx.agentId, ctx, key)
-          const opened = await this.openTask(owner, ctx.agentId, held.message, call.title, call.message, {
-            place: true
-          })
+          const taskKey = await this.openTask(owner, ctx.agentId, held.message, call.title, call.message)
           this.turns.settle(key, call.messageId, 'delegate')
           const note = threadless(held.message.msg)
             ? 'Task opened; it answers on its own page, which the conversation now links to.'
-            : opened.placed
-              ? "Task opened in a conversation of its own, which the message's thread now links to; it answers there."
-              : "Task opened; it answers in the message's thread."
-          return { ok: true, taskId: opened.taskKey, title: call.title, note }
+            : "Task opened; it answers in the message's thread."
+          return { ok: true, taskId: taskKey, title: call.title, note }
         }
         case 'messageTask': {
           const owners = new Set([key, await this.taskOwner(ctx.agentId, ctx, key)])
@@ -230,7 +228,7 @@ export class CoordinatorSessions {
             ? {
                 ok: true,
                 taskId: handed.taskKey,
-                note: "The message moved to the task's own conversation, which its thread now links to."
+                note: "The message moved to the task's own channel, which its thread now links to."
               }
             : { ok: true, taskId: handed.taskKey, attachedThread: call.messageId }
         }
@@ -273,15 +271,14 @@ export class CoordinatorSessions {
     return current === undefined ? callerKey : sessionKey(at.platform, at.channel, current, agentId, at.transportScope)
   }
 
-  /** Open a threaded task for a message (§5.1): its session is the message's thread, which it holds from now on, or with `place` a conversation of its own where the platform makes one (§6.8). */
+  /** Open a threaded task for a message (§5.1): its session is the message's thread, which it holds from now on (§6.4). */
   async openTask(
     coordinatorKey: string,
     agentId: string,
     message: DeliveredMessage,
     title: string,
-    background?: string,
-    opts: { place?: boolean } = {}
-  ): Promise<{ taskKey: string; placed: boolean }> {
+    background?: string
+  ): Promise<string> {
     const { msg } = message
     const store = this.host.store()
     const index = store.assistantSubsessions
@@ -293,15 +290,7 @@ export class CoordinatorSessions {
         `sendMessage: the thread of ${message.id} already belongs to task ${owner}; hand the message to it with action ` +
           `"messageTask" and that taskId`
       )
-    if (threadless(msg))
-      return { taskKey: await this.openPageTask(coordinatorKey, agentId, message, title, background), placed: false }
-    if (opts.place) {
-      const placed = await this.whilePlaceOpens(agentId, async (ready) => {
-        const place = await this.placeFor(agentId, message, title)
-        return place && (await this.openPlaceTask(coordinatorKey, agentId, message, place, title, background, ready))
-      })
-      if (placed !== undefined) return { taskKey: placed, placed: true }
-    }
+    if (threadless(msg)) return await this.openPageTask(coordinatorKey, agentId, message, title, background)
     const taskKey = sessionKey(msg.platform, msg.channel, thread, agentId, msg.transportScope)
     const now = this.host.now()
     const parentSessionId = await store.ensureOutwardSessionId(coordinatorKey, agentId, now)
@@ -312,6 +301,7 @@ export class CoordinatorSessions {
       parentSessionKey: coordinatorKey,
       title,
       background: background?.trim() || msg.text,
+      openedFor: openedForOf(message),
       replyThread: thread,
       now
     })
@@ -332,110 +322,57 @@ export class CoordinatorSessions {
       messageForTask(msg, { title, ...(background ? { background } : {}) }),
       message.integrationId
     )
-    return { taskKey, placed: false }
-  }
-
-  /** Run a place's making, from its creation until `ready` says its task and opening are kept, as one the platform's copy may wait for. */
-  private async whilePlaceOpens<T>(agentId: string, run: (ready: () => void) => Promise<T>): Promise<T> {
-    let ready!: () => void
-    const kept = new Promise<void>((resolve) => (ready = resolve))
-    const inFlight = this.placesInFlight.get(agentId) ?? new Set<Promise<void>>()
-    this.placesInFlight.set(agentId, inFlight)
-    inFlight.add(kept)
-    try {
-      return await run(ready)
-    } finally {
-      ready()
-      inFlight.delete(kept)
-      if (inFlight.size === 0) this.placesInFlight.delete(agentId)
-    }
-  }
-
-  /** The conversation of its own a platform gives a task for this message; none, a refusal or a failure keeps the task in the thread (§6.8). */
-  private async placeFor(agentId: string, message: DeliveredMessage, title: string): Promise<TaskPlace | undefined> {
-    if (!this.host.openTaskPlace) return undefined
-    try {
-      return await this.host.openTaskPlace(agentId, message.integrationId, message.msg, title)
-    } catch (err) {
-      this.host.warn(
-        `coordinator: the task for ${message.id} stays in its thread; no place of its own (${String(err)})`
-      )
-      return undefined
-    }
-  }
-
-  /** A task in a conversation of its own (§6.8): its session is the place's, which it holds as its thread, and the message's thread links there. */
-  private async openPlaceTask(
-    coordinatorKey: string,
-    agentId: string,
-    message: DeliveredMessage,
-    place: TaskPlace,
-    title: string,
-    background: string | undefined,
-    ready: () => void
-  ): Promise<string> {
-    const { msg } = message
-    const store = this.host.store()
-    const index = store.assistantSubsessions
-    const at = { platform: msg.platform, ...place, transportScope: msg.transportScope ?? '' }
-    // A creation the platform answered with a place it made before finds the task already there.
-    const holder = await index.taskOfThread(agentId, at)
-    if (holder !== undefined) return holder
-    const taskKey = sessionKey(msg.platform, place.channel, place.thread, agentId, msg.transportScope)
-    const now = this.host.now()
-    const parentSessionId = await store.ensureOutwardSessionId(coordinatorKey, agentId, now)
-    const opened = await index.open({
-      agentId,
-      childSessionKey: taskKey,
-      parentSessionId,
-      parentSessionKey: coordinatorKey,
-      title,
-      background: background?.trim() || msg.text,
-      replyThread: place.thread,
-      now
-    })
-    if (!opened && (await index.get(agentId, taskKey))?.parentSessionKey !== coordinatorKey)
-      throw new Error(
-        `sendMessage: the place made for ${message.id} already has a session of its own; nothing was opened`
-      )
-    await index.attachThread({ agentId, childSessionKey: taskKey, ...at, sinceRound: 1, now })
-    // The platform brings the message into its place itself, and that copy opens the task: nothing is dispatched here.
-    this.rememberOpening(taskKey, msg.sender.id, title, background)
-    ready()
-    await this.host.reportTaskOwners(agentId, [taskKey])
-    await this.postTaskLink(agentId, message, taskKey, title, 'opened', this.placeLink(message, place))
     return taskKey
   }
 
-  private placeLink(message: DeliveredMessage, place: TaskPlace): string | undefined {
-    return this.host.threadLink?.(message.integrationId, { platform: message.msg.platform, ...place })
-  }
-
-  private rememberOpening(taskKey: string, sender: string, title: string, background?: string): void {
-    const trimmed = background?.trim()
-    this.placeOpenings.delete(taskKey)
-    if (this.placeOpenings.size >= MAX_PLACE_OPENINGS)
-      this.placeOpenings.delete(this.placeOpenings.keys().next().value!)
-    this.placeOpenings.set(taskKey, {
-      title,
-      ...(trimmed ? { background: trimmed } : {}),
-      sender,
-      until: this.host.now() + TASK_PLACE_OPENING_MS
+  /** A room a session made for its work (§6.8): a task opened for a message holds it as one more thread, and a message there waits while it is attached; any other session's room stays its own. */
+  async makeRoom<T>(
+    agentId: string,
+    taskKey: string,
+    make: () => Promise<{ result: T; room?: TaskRoom & { platform: string; transportScope?: string | null } }>
+  ): Promise<T> {
+    const index = this.host.store().assistantSubsessions
+    const row = await index.get(agentId, taskKey)
+    // A thread session adopted into `auto` was opened for no message, and holds no room (§3.5).
+    if (row?.openedFor === undefined || row.mode === 'watch') return (await make()).result
+    return await this.whileRoomAttaches(agentId, async () => {
+      const { result, room } = await make()
+      if (room) {
+        const held = await index.attachThread({
+          agentId,
+          childSessionKey: taskKey,
+          ...room,
+          transportScope: room.transportScope ?? '',
+          sinceRound: row.round ?? 1,
+          now: this.host.now()
+        })
+        if (!held && (await index.taskOfThread(agentId, room)) !== taskKey)
+          this.host.warn(`coordinator: task ${taskKey} made ${room.channel}, which another task already holds`)
+      }
+      return result
     })
   }
 
-  /** The platform's copy of a message reaching the task opened for it in its place: it waits for a place still being made, then takes the coordinator's title and background, once (§6.8). */
-  async placeOpening(agentId: string, key: string, msg: NormalizedMessage): Promise<void> {
-    if (msg.source !== 'user' || !wholeRoomThread(msg) || this.movedMessages.has(msg)) return
-    const inFlight = this.placesInFlight.get(agentId)
-    if (inFlight?.size) await settledWithin([...inFlight], TASK_PLACE_CREATION_WAIT_MS)
-    const opening = this.placeOpenings.get(key)
-    // Only the copy of the message the place was made for, which its own sender posts there, takes it.
-    if (!opening || opening.sender !== msg.sender.id) return
-    this.placeOpenings.delete(key)
-    if (opening.until < this.host.now()) return
-    msg.initialSessionTitle = opening.title
-    if (opening.background) msg.turnBody = withBackground(msg, opening.background)
+  /** Run a room's making until its task holds it, as one a message in a room keyed as one thread waits for. */
+  private async whileRoomAttaches<T>(agentId: string, run: () => Promise<T>): Promise<T> {
+    let attached!: () => void
+    const kept = new Promise<void>((resolve) => (attached = resolve))
+    const inFlight = this.roomsInFlight.get(agentId) ?? new Set<Promise<void>>()
+    this.roomsInFlight.set(agentId, inFlight)
+    inFlight.add(kept)
+    try {
+      return await run()
+    } finally {
+      attached()
+      inFlight.delete(kept)
+      if (inFlight.size === 0) this.roomsInFlight.delete(agentId)
+    }
+  }
+
+  /** A message in a room keyed as one thread waits for the rooms its agent's tasks are still attaching, at most 30 seconds, since it may be the platform's copy into one (§6.8). */
+  async roomsAttached(agentId: string): Promise<void> {
+    const inFlight = this.roomsInFlight.get(agentId)
+    if (inFlight?.size) await settledWithin([...inFlight], TASK_ROOM_ATTACH_WAIT_MS)
   }
 
   /** A task for a message of a conversation without threads (§10): a background coordinate whose page is its conversation, holding the message's id as its thread so it never reports. */
@@ -461,6 +398,7 @@ export class CoordinatorSessions {
       parentSessionKey: coordinatorKey,
       title,
       background: background?.trim() || msg.text,
+      openedFor: openedForOf(message),
       now
     })
     await index.attachThread({
@@ -517,13 +455,15 @@ export class CoordinatorSessions {
     const { msg } = message
     const store = this.host.store()
     const index = store.assistantSubsessions
+    // A taskId is the task's key or a unique prefix of it, as listTasks and the board show it (assistant-mode.md §5.18 ④).
+    const key = await index.resolve(agentId, taskId)
     const row =
-      (await index.get(agentId, taskId)) ??
+      (key !== undefined ? await index.get(agentId, key) : undefined) ??
       (await store.getSessionByOutwardIdOnly(taskId, agentId).then((s) => (s ? index.get(agentId, s.key) : undefined)))
     // A message without a thread moves only to a task on its own page (§10).
     if (
       !row ||
-      row.kind === 'follow-up' ||
+      row.mode === 'watch' ||
       !owners.has(row.parentSessionKey) ||
       (threadless(msg) && pageTaskCoordinate(row.childSessionKey, msg.platform, agentId) === undefined)
     )
@@ -534,20 +474,13 @@ export class CoordinatorSessions {
         `sendMessage: task ${taskId} works in the background and cannot take a channel message; open a task for the ` +
           'message with action "delegateTask" instead'
       )
-    const place = threadless(msg) ? undefined : await this.placeOf(row.childSessionKey, threads, msg)
-    if (place) {
-      // Its thread stays the coordinator's: the task answers in its place, which the thread links to.
-      const moved = messageForPlaceTask(msg, place, background ? { background } : {})
-      this.movedMessages.add(moved)
+    const room = threadless(msg) ? undefined : this.roomOf(threads, msg)
+    if (room) {
+      // Its thread stays the coordinator's: the task answers in the channel it holds, which the thread links to.
+      const session = await this.sessionOf(row.childSessionKey, threads)
+      const moved = messageForRoomTask(msg, room, session, background ? { background } : {})
       this.host.dispatch(agentId, moved, message.integrationId)
-      await this.postTaskLink(
-        agentId,
-        message,
-        row.childSessionKey,
-        row.title,
-        'handed',
-        this.placeLink(message, place)
-      )
+      await this.postTaskLink(agentId, message, row.childSessionKey, row.title, 'handed', this.roomLink(message, room))
       return { taskKey: row.childSessionKey, moved: true }
     }
     const thread = replyThreadOf(msg)
@@ -570,15 +503,21 @@ export class CoordinatorSessions {
     return { taskKey: row.childSessionKey, moved: false }
   }
 
-  /** A task's place, when it works in a conversation other than the message's (§6.8). */
-  private async placeOf(
-    taskKey: string,
-    threads: readonly { channel: string; thread: string }[],
-    msg: NormalizedMessage
-  ): Promise<TaskPlace | undefined> {
+  /** The newest room a task holds in a conversation other than the message's, where a message moves (§6.8). */
+  private roomOf(threads: readonly TaskRoom[], msg: NormalizedMessage): TaskRoom | undefined {
+    const rooms = threads.filter((at) => at.channel !== msg.channel && wholeRoomThread(at))
+    const room = rooms[rooms.length - 1]
+    return room && { channel: room.channel, thread: room.thread }
+  }
+
+  /** Where a task's session lives: its row's coordinate, else the first thread it held. */
+  private async sessionOf(taskKey: string, threads: readonly TaskRoom[]): Promise<TaskRoom> {
     const session = await this.host.store().getSession(taskKey)
-    const home = session ? { channel: session.channel, thread: session.thread } : threads[0]!
-    return home.channel === msg.channel ? undefined : { channel: home.channel, thread: home.thread }
+    return session ? { channel: session.channel, thread: session.thread } : threads[0]!
+  }
+
+  private roomLink(message: DeliveredMessage, room: TaskRoom): string | undefined {
+    return this.host.threadLink?.(message.integrationId, { platform: message.msg.platform, ...room })
   }
 
   /** Dispatch a message to a threaded task: the task keeps its own session, the message's thread stays where it answers (§6.4). */
@@ -671,20 +610,13 @@ export class CoordinatorSessions {
     await this.host.reportTaskOwners(agentId, moved)
   }
 
-  /** End a coordinator turn: a one-message turn's text is its reply, and a mention left without an outcome goes to a task (§4.3, §4.5). */
+  /** End a coordinator turn: its final text is never posted, and a mention left without an outcome goes to a task (§4.3, §4.5). */
   async settleTurn(key: string, agentId: string, ended: 'answered' | 'failed' | 'stopped'): Promise<void> {
     const settled = this.turns.end(key, isNoResponsePrefix)
     // A stopped turn was stopped on purpose: nothing it left undecided is acted on.
     if (!settled || ended === 'stopped') return
-    if (ended === 'answered' && settled.reply !== undefined) {
-      const [message] = settled.undecided
-      // A reply a browser already streamed is committed with its turn.
-      if (message!.streamed) return
-      await this.host
-        .post(agentId, message!.integrationId, message!.msg, settled.reply)
-        .catch((err: unknown) => this.host.warn(`coordinator ${key}: reply to ${message!.id} failed (${String(err)})`))
-      return
-    }
+    // Only a browser that streamed the text shows it, and commits it with its turn; elsewhere the coordinator acts through its calls alone.
+    if (ended === 'answered' && settled.reply !== undefined && settled.undecided[0]!.streamed) return
     for (const message of settled.undecided) {
       if (!message.mentionsYou) continue
       await this.fallBack(key, agentId, message).catch((err: unknown) =>
@@ -695,7 +627,12 @@ export class CoordinatorSessions {
 }
 
 /** The delivered-message entry for one admitted coordinator message; anything but a channel message is a report (§3.4). */
-export function deliveredMessage(msg: NormalizedMessage, integrationId?: string, streamed = false): DeliveredMessage {
+export function deliveredMessage(
+  msg: NormalizedMessage,
+  integrationId?: string,
+  streamed = false,
+  about?: ReportAbout
+): DeliveredMessage {
   const report = msg.source !== 'user'
   return {
     id: coordinatorMessageId(platformMessageIdOf(msg)),
@@ -703,6 +640,7 @@ export function deliveredMessage(msg: NormalizedMessage, integrationId?: string,
     ...(integrationId !== undefined ? { integrationId } : {}),
     mentionsYou: !report && msg.trigger === 'mention',
     ...(report ? { report: true as const } : {}),
+    ...(report && about ? { about } : {}),
     ...(streamed ? { streamed: true as const } : {})
   }
 }

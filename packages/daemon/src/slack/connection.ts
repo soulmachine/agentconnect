@@ -49,7 +49,7 @@ import { isSendQueueTimeout, PlatformSendQueue } from '../platforms/send-queue.j
 import { markNotJoined } from '../platforms/not-joined.js'
 import { slackMessageUrl } from '../platforms/slack/permalink.js'
 import { SLACK_CODE_CHANNEL_CONTEXT, SLACK_CONVERSATION_CONTEXT } from '../platforms/slack/standing-context.js'
-import { createCodeChannel } from '../platforms/slack/code-channel.js'
+import { CodeTasksViews, SLACK_TASKS_VIEW_KEY, type CodeTasksSnapshot } from '../platforms/slack/code-tasks.js'
 import type { UploadAnchor, UploadFailReason, UploadOutcome } from '../mcp/ops/context.js'
 import {
   STATUS_ACTION,
@@ -91,9 +91,7 @@ import type {
   PlatformReactionSummary,
   PlatformScheduledMessage,
   PlatformSearchOptions,
-  PlatformSearchResults,
-  TaskPlace,
-  TaskPlaceOrigin
+  PlatformSearchResults
 } from '../platforms/contract.js'
 
 /**
@@ -490,6 +488,8 @@ export interface SlackDeps {
   /** Every local session in one Slack conversation, newest first — the stop's fallback
    *  resolver when no displayed owner is recorded (e.g. right after a reconnect). */
   onThreadSessions?: (a: { channel: string; thread: string }) => Promise<string[]>
+  // The same scoped task snapshot the console reads, including background runtime work.
+  onCodeTasks?: (channel: string, sessionKey: string) => Promise<CodeTasksSnapshot | undefined>
   /** Release the delegated tasks holding this thread's indicator and return their keys, for a Stop to cancel. */
   onStopThreadTasks?: (a: { channel: string; thread: string }) => string[]
   /** A code channel was archived: the task it holds closes (auto-session-mode.md §6.8). */
@@ -763,9 +763,10 @@ export type AppLike = {
       // predates it fails here with missing_scope rather than being marked broken.
       get: (a: unknown) => Promise<{ message?: { reactions?: { name?: string; count?: number; users?: string[] }[] } }>
     }
-    // Slack Canvas (`canvases:write`, plus `canvases:read` for the section anchors).
+    // Canvas bodies and heading anchors require canvases:read; edits require canvases:write.
     canvases: {
       create: (a: unknown) => Promise<{ canvas_id?: string }>
+      getContent: (a: unknown) => Promise<{ content?: string }>
       edit: (a: unknown) => Promise<unknown>
       sections: { lookup: (a: unknown) => Promise<{ sections?: { id?: string }[] }> }
     }
@@ -1171,14 +1172,9 @@ export class SlackConnection implements PlatformConnection {
     }
   }
 
-  /** A coordinator's task works in a code channel linked to its message (auto-session-mode.md §6.8); none when the message already sits in one. */
-  async openTaskPlace(origin: TaskPlaceOrigin, title: string): Promise<TaskPlace | undefined> {
-    // The daemon has judged whether the message's sender may have a channel made before it asks.
-    const created = await createCodeChannel(this, { ...origin, ts: origin.messageId }, title, async () => {})
-    if (created.existing) return undefined
-    if (created.channelId === undefined) throw new Error('Slack answered the code channel creation without a channel')
-    // A code channel's one session keys on the channel itself (slack-code-channels.md).
-    return { channel: created.channelId, thread: created.channelId }
+  /** A code channel is one session keyed on the channel, so a root post there belongs to it (slack-code-channels.md). */
+  async roomThread(channel: string): Promise<string | undefined> {
+    return (await this.codeChannel(channel).catch(() => undefined))?.code ? channel : undefined
   }
 
   async prepareInboundMessage(msg: NormalizedMessage): Promise<void> {
@@ -1201,6 +1197,28 @@ export class SlackConnection implements PlatformConnection {
 
   /** A code channel's Plan tab canvas, its newest unwritten plan, and the writer draining it. */
   private readonly planCanvases = new Map<string, { canvasId?: string; pending?: string; running?: Promise<void> }>()
+
+  private readonly taskViews = new CodeTasksViews({
+    read: async (channel, key) => {
+      const info = await this.codeChannel(channel)
+      if (!info.code || !info.owners.includes(this.botUserId)) return undefined
+      return this.deps.onCodeTasks?.(channel, key)
+    },
+    publish: async (channel, blocks, signal) => {
+      await this.codeChannelApi(
+        'setView',
+        {
+          channel_id: channel,
+          type: 'block_kit',
+          view_key: SLACK_TASKS_VIEW_KEY,
+          name: 'Tasks',
+          blocks
+        },
+        signal
+      )
+    },
+    debug: (message) => this.deps.log?.debug(message)
+  })
 
   /** Mirror the plan into the code channel's Plan tab: a canvas the team comments on and only the agent edits. */
   writePlanCanvas(channel: string, markdown: string): void {
@@ -2105,7 +2123,6 @@ export class SlackConnection implements PlatformConnection {
       isDm?: boolean
       recipientUserId?: string
       identity?: SlackPostOptions
-      taskDisplayMode?: 'timeline' | 'plan'
     } = {}
   ): Promise<SlackTurnStream | undefined> {
     const start = this.app.client.chat.startStream
@@ -2128,7 +2145,7 @@ export class SlackConnection implements PlatformConnection {
       .enqueue(async () => {
         let result: SlackTurnStream | undefined
         try {
-          result = await this.openStream(start, channel, threadTs, recipient, options.identity, options.taskDisplayMode)
+          result = await this.openStream(start, channel, threadTs, recipient, options.identity)
           return result
         } finally {
           publish(result)
@@ -2148,14 +2165,13 @@ export class SlackConnection implements PlatformConnection {
     channel: string,
     threadTs: string,
     recipient: string | undefined,
-    identity?: SlackPostOptions,
-    taskDisplayMode: 'timeline' | 'plan' = 'timeline'
+    identity?: SlackPostOptions
   ): Promise<SlackTurnStream | undefined> {
-    // Work steps render individually; minimal mode keeps interim replies in a folded plan.
+    // Keep work steps and Minimal's interim reply history in a collapsible group.
     const payload: Record<string, unknown> = {
       channel,
       ...(threadTs !== channel ? { thread_ts: threadTs } : {}),
-      task_display_mode: taskDisplayMode,
+      task_display_mode: 'plan',
       ...(recipient ? { recipient_user_id: recipient } : {}),
       ...(recipient && this.teamId ? { recipient_team_id: this.teamId } : {})
     }
@@ -3483,31 +3499,25 @@ export class SlackConnection implements PlatformConnection {
     }
   }
 
-  /**
-   * Read a canvas back.
-   *
-   * Slack publishes NO full-content read: `canvases:read` buys `canvases.sections.lookup`,
-   * which answers with section ids and no text. So the body is fetched the way any other
-   * Slack file is — `files.info` for the private URL, then the credentialed download this
-   * connection already performs — and is simply ABSENT when that path does not serve text.
-   * The metadata and the section anchors an edit needs are always returned.
-   */
+  // Read the complete Markdown body and fresh heading anchors through the Canvas API.
   async readCanvas(canvasId: string): Promise<PlatformCanvas> {
-    let file: { title?: string; permalink?: string; url_private?: string }
     try {
-      const res = await this.app.client.files.info({ file: canvasId })
-      file = res.file ?? {}
+      const [metadata, body, sections] = await Promise.all([
+        this.app.client.files.info({ file: canvasId }),
+        this.app.client.canvases.getContent({ canvas_id: canvasId, content_type: 'markdown' }),
+        this.canvasSections(canvasId)
+      ])
+      if (typeof body.content !== 'string') throw new Error('Slack canvases.getContent returned no content')
+      const file = metadata.file ?? {}
+      return {
+        id: canvasId,
+        ...(file.title ? { title: file.title } : {}),
+        ...(file.permalink ? { url: file.permalink } : {}),
+        markdown: body.content,
+        ...(sections ? { sections } : {})
+      }
     } catch (err) {
       throw this.toolFailure(err, 'reading a canvas')
-    }
-    const sections = await this.canvasSections(canvasId)
-    const bytes = file.url_private ? await this.downloadFile(file.url_private) : null
-    return {
-      id: canvasId,
-      ...(file.title ? { title: file.title } : {}),
-      ...(file.permalink ? { url: file.permalink } : {}),
-      ...(bytes ? { markdown: bytes.toString('utf8') } : {}),
-      ...(sections ? { sections } : {})
     }
   }
 
@@ -3563,15 +3573,7 @@ export class SlackConnection implements PlatformConnection {
     }
   }
 
-  /**
-   * The addressable sections of a canvas, or undefined when the workspace did not grant
-   * `canvases:read` — the edit anchors are then unknown, not an error.
-   *
-   * HEADINGS ONLY, and that is the public API's ceiling rather than a choice: `criteria` is
-   * required and its `section_types` vocabulary is `any_header|h1|h2|h3`, so there is no
-   * request that returns every section. The ids are also invalidated by each edit, which is
-   * why `readCanvas` is documented as a call to make immediately before `updateCanvas`.
-   */
+  // Lookup exposes heading anchors only; fetch fresh IDs before each edit and omit them on failure.
   private async canvasSections(canvasId: string): Promise<{ id: string }[] | undefined> {
     try {
       const res = await this.app.client.canvases.sections.lookup({
@@ -3611,7 +3613,10 @@ export class SlackConnection implements PlatformConnection {
     if (this.deps.sendOnly || archived) {
       const sessionKeys = (await this.deps.onThreadSessions?.({ channel, thread: threadTs })) ?? []
       const tasks = this.deps.onStopThreadTasks?.({ channel, thread: threadTs }) ?? []
-      for (const sessionKey of new Set([...sessionKeys, ...tasks])) cancel(sessionKey)
+      // The session whose own turn archived the channel ends that turn itself, after its wrap-up.
+      const archivedBy = archived ? this.ownArchives.get(channel) : undefined
+      if (archived) this.ownArchives.delete(channel)
+      for (const sessionKey of new Set([...sessionKeys, ...tasks])) if (sessionKey !== archivedBy) cancel(sessionKey)
       if (archived && threadTs === channel) this.codeChannelArchived(channel)
       await this.queue.enqueue(() => this.setSessionLifecycle(channel, threadTs, 'active'))
       return
@@ -3630,7 +3635,26 @@ export class SlackConnection implements PlatformConnection {
 
   /** An archived code channel closes the task it holds, whoever archived it; closing twice is harmless. */
   codeChannelArchived(channel: string): void {
+    this.taskViews.stop(channel)
     this.deps.onPlaceClosed?.({ channel, thread: channel })
+  }
+
+  /** Sessions archiving their own code channel, by channel, so Slack's archive event does not cancel the turn that asked for it. */
+  private readonly ownArchives = new Map<string, string>()
+
+  /** Archive a code channel for the session `by` whose turn asked, echoing `summaryTs` to the origin, and close its task. */
+  async archiveCodeChannel(channel: string, summaryTs: string | undefined, by: string): Promise<unknown> {
+    await this.closeCodeSession(channel)
+    // Noted before the call: Slack's archive event can arrive before its answer does.
+    this.ownArchives.set(channel, by)
+    try {
+      const archived = await this.codeChannelApi('archive', { channel_id: channel, summary_message_ts: summaryTs })
+      this.codeChannelArchived(channel)
+      return archived
+    } catch (err) {
+      if (this.ownArchives.get(channel) === by) this.ownArchives.delete(channel)
+      throw err
+    }
   }
 
   // The lifecycle half of setStatus. Posting a message does NOT end the loading UX — only `active` does.
@@ -3643,6 +3667,11 @@ export class SlackConnection implements PlatformConnection {
     options?: SlackStatusOptions
   ): Promise<boolean> {
     const key = `${channel}:${threadTs}`
+    if (threadTs === channel && this.deps.onCodeTasks) {
+      if (status === 'closed') this.taskViews.stop(channel)
+      else if (status === 'active') this.taskViews.idle(channel)
+      else if (options?.sessionKey) this.taskViews.watch(channel, options.sessionKey)
+    }
     // A waiting session keeps the identity of the agent that is waiting, like a working one.
     const owned = (status === 'processing' || status === 'suspended') && !this.statusIdentityUnsupported
     const username = owned ? options?.username?.trim() : undefined
@@ -3704,6 +3733,7 @@ export class SlackConnection implements PlatformConnection {
   }
 
   async stop(): Promise<void> {
+    this.taskViews.stop()
     for (const key of [...this.owedStops.keys()]) this.forgetOwedStop(key)
     await this.app.stop()
   }

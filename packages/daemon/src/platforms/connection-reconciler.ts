@@ -99,6 +99,11 @@ export type PlatformConnection =
 export interface PlatformActionSink {
   handleStatusAction: NonNullable<SlackDeps['onStatusAction']>
   statusInfoForKey: NonNullable<SlackDeps['onStatusInfo']>
+  slackCodeTasks(
+    channel: string,
+    sessionKey: string,
+    srcIntegrationIds: readonly string[]
+  ): ReturnType<NonNullable<SlackDeps['onCodeTasks']>>
   // `srcIntegrationIds`: the bots of the connection a Socket Mode click arrived on, which a capability Decline is checked against.
   handlePermissionChoice: (
     a: Parameters<NonNullable<SlackDeps['onPermissionChoice']>>[0] & { srcIntegrationIds?: readonly string[] }
@@ -220,7 +225,7 @@ export interface ConnectionReconcilerHost extends PlatformActionSink {
   srcIntegrationIds(conn: unknown): string[]
   /** Where a platform's finding that a place is external goes (assistant-mode.md §5.3). */
   placeTrust(): PlaceTrust
-  /** A genuine join of the agent's bot to a conversation: true when a getting-to-know task takes it, which replaces the join introduction (assistant-mode.md §5.13). */
+  /** A genuine join of the agent's bot to a conversation: true when a getting-to-know task takes it, which replaces the join introduction (assistant-mode.md §5.13), or when a task holds the channel, which takes neither (auto-session-mode.md §6.8). */
   gettingToKnowOnJoin(agentId: string, integrationId: string, channel: string, inviter?: string): Promise<boolean>
   /** Drain the in-flight turns holding `conn` before it is stopped. */
   waitForConnectionUses(conn: PlatformConnection): Promise<void>
@@ -473,6 +478,7 @@ export class ConnectionReconciler {
       onSlotSettle: (a) => this.host.settleSlackSlot(conn(), a),
       onStatusAction: (a) => this.host.handleStatusAction(a),
       onStatusInfo: (key) => this.host.statusInfoForKey(key),
+      onCodeTasks: (channel, key) => this.host.slackCodeTasks(channel, key, this.host.srcIntegrationIds(conn())),
       onPermissionChoice: (a) =>
         this.host.handlePermissionChoice({ ...a, srcIntegrationIds: this.host.srcIntegrationIds(conn()) }),
       onElicitChoice: (a) => this.host.handleElicitChoice(a),
@@ -807,6 +813,7 @@ export class ConnectionReconciler {
             onSlotSettle: (a) => this.host.settleSlackSlot(created, a),
             onStatusAction: (a) => this.host.handleStatusAction(a),
             onStatusInfo: (key) => this.host.statusInfoForKey(key),
+            onCodeTasks: (channel, key) => this.host.slackCodeTasks(channel, key, this.host.srcIntegrationIds(created)),
             onPermissionChoice: (a) => this.host.handlePermissionChoice(a),
             onElicitChoice: (a) => this.host.handleElicitChoice(a),
             onElicitFormSubmit: (a) => this.host.handleElicitFormSubmit(a),

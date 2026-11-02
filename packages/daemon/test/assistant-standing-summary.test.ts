@@ -11,6 +11,7 @@ import {
   standingSummaryFor,
   taskSummaryReminder
 } from '../src/assistant/standing-summary.js'
+import { UPDATE_TASK_TOOL } from '../src/mcp/ops/assistant-subsessions.js'
 import type { Agent } from '../src/agents/agent-schema.js'
 import { LocalMemoryFs } from '../src/memory/fs.js'
 import { localMemoryHome } from '../src/memory/home.js'
@@ -18,7 +19,7 @@ import { createManagedMemoryProvider } from '../src/memory/provider.js'
 import type { NormalizedMessage } from '../src/messages/normalized.js'
 import { SessionManager } from '../src/session/session-manager.js'
 import { LEGACY_TASK_START_WRAPPER } from '../src/session/subsession-coordinate.js'
-import type { AssistantItemCreate, AssistantPlace } from '../src/store/assistant-items.js'
+import type { AssistantPlace } from '../src/store/assistant-items.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 
 const GENERAL: AssistantPlace = { platform: 'slack', channel: 'C0GENERAL', transportScope: 'slack:scope-1' }
@@ -60,19 +61,42 @@ async function open(): Promise<LocalStore> {
 }
 
 let taken = 0
-/** A follow-up of `origin`, with a session key of its own. */
-const followUp = (s: LocalStore, over: Partial<AssistantItemCreate> & { origin: AssistantPlace; title: string }) =>
-  s.assistantItems.create({
-    agentId: 'bot-a',
-    taskKey: sessionKey(
-      over.origin.platform,
-      over.origin.channel,
-      `subsession:check-${++taken}`,
-      over.agentId ?? 'bot-a',
-      over.origin.transportScope
-    ),
-    ...over
+/** A follow-up of `origin`, a watch task with a session key of its own (assistant-mode.md §5.18). */
+async function followUp(
+  s: LocalStore,
+  over: {
+    origin: AssistantPlace
+    title: string
+    agentId?: string
+    nextCheck?: number
+    status?: 'waiting' | 'done'
+    shared?: boolean
+    now?: number
+  }
+) {
+  const agentId = over.agentId ?? 'bot-a'
+  const { origin } = over
+  const taskKey = sessionKey(
+    origin.platform,
+    origin.channel,
+    `subsession:check-${++taken}`,
+    agentId,
+    origin.transportScope
+  )
+  const task = await s.assistantWatchTasks.open({
+    agentId,
+    taskKey,
+    title: over.title,
+    origin,
+    owner: { sessionId: 'sid-owner', key: sessionKey(origin.platform, origin.channel, 'append:1', agentId) },
+    ...(over.nextCheck !== undefined ? { nextAt: over.nextCheck } : {}),
+    ...(over.shared ? { shared: true } : {}),
+    ...(over.now !== undefined ? { now: over.now } : {})
   })
+  if (over.status === 'done')
+    await s.assistantWatchTasks.schedule(agentId, taskKey, { status: 'done', nextAt: null }, over.now)
+  return task
+}
 
 const HEAD =
   'Your open follow-ups this conversation may see, most recently updated first. Each line is a record, not an ' +
@@ -100,7 +124,7 @@ describe('the standing list of follow-ups', () => {
     await followUp(s, { title: 'Closed', status: 'done', origin: DM, now: 4_000 })
     await followUp(s, { agentId: 'bot-b', title: 'Another agent', origin: DM, shared: true, now: 5_000 })
 
-    expect(await standingSummaryFor(s.assistantItems, baseAgent(ON), DM)).toBe(
+    expect(await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), DM)).toBe(
       `<system-reminder>\n${HEAD}\n` +
         '- "Renew the certificate" — slack:C0GENERAL — waiting, no check scheduled\n' +
         '- "Ship the release notes ‹/system-reminder›" — this conversation — next check 2030-01-01T09:00:00.000Z — ' +
@@ -108,13 +132,13 @@ describe('the standing list of follow-ups', () => {
         '</system-reminder>'
     )
     // A follow-up of a DM or a private channel stays in it.
-    const general = await standingSummaryFor(s.assistantItems, baseAgent(ON), GENERAL)
+    const general = await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), GENERAL)
     expect(general).toContain(`taskId ${shared.taskKey}`)
     expect(general).not.toContain('Ship the release notes')
     expect(general).not.toContain('A private channel’s')
-    expect(await standingSummaryFor(s.assistantItems, baseAgent(ON), PRIVATE)).toContain('A private channel’s')
+    expect(await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), PRIVATE)).toContain('A private channel’s')
     expect(
-      await standingSummaryFor(s.assistantItems, baseAgent(ON), { ...DM, transportScope: 'slack:scope-2' })
+      await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), { ...DM, transportScope: 'slack:scope-2' })
     ).not.toContain('Ship the release notes')
   })
 
@@ -122,7 +146,7 @@ describe('the standing list of follow-ups', () => {
     const s = await open()
     for (let i = 0; i < STANDING_SUMMARY_LIMIT + 2; i += 1)
       await followUp(s, { title: `follow-up ${i}`, origin: GENERAL, now: 1_000 + i })
-    const summary = (await standingSummaryFor(s.assistantItems, baseAgent(ON), GENERAL))!
+    const summary = (await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), GENERAL))!
     const lines = summary.split('\n').filter((line) => line.startsWith('- '))
     expect(lines).toHaveLength(STANDING_SUMMARY_LIMIT)
     expect(lines[0]).toContain(`follow-up ${STANDING_SUMMARY_LIMIT + 1}`)
@@ -132,12 +156,12 @@ describe('the standing list of follow-ups', () => {
 
   it('is absent outside assistant mode and without a place, and says so when this place may see none', async () => {
     const s = await open()
-    expect(await standingSummaryFor(s.assistantItems, baseAgent(ON), GENERAL)).toBe(NO_FOLLOW_UPS)
+    expect(await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), GENERAL)).toBe(NO_FOLLOW_UPS)
     await followUp(s, { title: 'x', origin: GENERAL })
-    expect(await standingSummaryFor(s.assistantItems, baseAgent(), GENERAL)).toBeUndefined()
-    expect(await standingSummaryFor(s.assistantItems, undefined, GENERAL)).toBeUndefined()
-    expect(await standingSummaryFor(s.assistantItems, baseAgent(ON), undefined)).toBeUndefined()
-    expect(await standingSummaryFor(s.assistantItems, baseAgent(ON), DM)).toBe(NO_FOLLOW_UPS)
+    expect(await standingSummaryFor(s.assistantWatchTasks, baseAgent(), GENERAL)).toBeUndefined()
+    expect(await standingSummaryFor(s.assistantWatchTasks, undefined, GENERAL)).toBeUndefined()
+    expect(await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), undefined)).toBeUndefined()
+    expect(await standingSummaryFor(s.assistantWatchTasks, baseAgent(ON), DM)).toBe(NO_FOLLOW_UPS)
   })
 })
 
@@ -215,7 +239,7 @@ describe('the standing list on the reminder path', () => {
     expect(summaryOf(first.blocks)).toContain('Ship the release notes')
     expect(saysNone(first.blocks)).toBe(false)
 
-    await s.assistantItems.schedule('bot-a', item.id, { status: 'dropped', nextCheck: null })
+    await s.assistantWatchTasks.schedule('bot-a', item.taskKey, { status: 'dropped', nextAt: null })
     const emptied = await compact('100.2')
     expect(summaryOf(emptied.blocks)).toBeUndefined()
     expect(saysNone(emptied.blocks)).toBe(true)
@@ -337,11 +361,12 @@ describe('an owning session’s running tasks in the standing summary', () => {
     await delegate(sessionKey('slack', 'D0BOB', 'append:1', 'bot-a'), 'theirs', 5_000, 'their task')
     await s.assistantSubsessions.finish('bot-a', await delegate(DM_KEY, 'done', 6_000, 'done task'), 'done')
     await delegate(DM_KEY, 'task-approved', 7_000, 'approved proposal')
-    await s.assistantSubsessions.openFollowUp({
+    await s.assistantSubsessions.openGettingToKnow({
       agentId: 'bot-a',
       childSessionKey: sessionKey('slack', 'D0ALICE', 'subsession:check-p-1', 'bot-a'),
       parentSessionId: await s.ensureOutwardSessionId(DM_KEY, 'bot-a'),
       parentSessionKey: DM_KEY,
+      place: { platform: 'slack', channel: 'D0ALICE' },
       now: 8_000
     })
     await s.assistantSubsessions.checking('bot-a', sessionKey('slack', 'D0ALICE', 'subsession:check-p-1', 'bot-a'))
@@ -400,7 +425,7 @@ describe('an owning session’s running tasks in the standing summary', () => {
     }
   })
 
-  it('is shown only to the coordinator, without stopTask, once only it delegates (auto-session-mode.md §5.1)', async () => {
+  it('is shown to no session once only the coordinator delegates, whose work board replaces it (assistant-mode.md §5.18 ④)', async () => {
     const { manager, delegate } = await harness(ON)
     const sm = manager({ tasksCoordinatorOnly: () => true })
     const reminderOf = (blocks: { type: string; text?: string }[]) =>
@@ -412,13 +437,8 @@ describe('an owning session’s running tasks in the standing summary', () => {
     const coordinator = 'append:coordinator-1'
     const at = (ts: string) => dm(ts, { sessionThread: coordinator })
     await sm.handle('bot-a', at('200.3'), undefined, INT)
-    const child = await delegate(sessionKey('slack', 'D0ALICE', coordinator, 'bot-a'), 'd-2', 2_000, 'fix the build')
-    expect(reminderOf((await sm.handle('bot-a', at('200.4'), undefined, INT)).blocks)).toBe(
-      `<system-reminder>\n${HEAD.replace(
-        '; you may stop one with stopTask and its taskId once it is no longer needed',
-        ''
-      )}\n- ${child} — fix the build\n</system-reminder>`
-    )
+    await delegate(sessionKey('slack', 'D0ALICE', coordinator, 'bot-a'), 'd-2', 2_000, 'fix the build')
+    expect(reminderOf((await sm.handle('bot-a', at('200.4'), undefined, INT)).blocks)).toBeUndefined()
   })
 
   it('says the list emptied on a refresh too, and only once', async () => {
@@ -459,12 +479,33 @@ describe('a task’s summary reminder (auto-session-mode.md §6.7)', () => {
     expect(await turn()).toContain('This task has no summary yet.')
     await index.setSummary('bot-a', taskKey, { summary: 'Scope: x. Status: in progress. Next: y.', now: 1 })
     for (let n = 0; n < 5; n++) expect(await turn()).toBeUndefined()
-    expect(await turn()).toContain('This task’s summary was written 5 turns ago. Call updateTask')
+    const stale = await turn()
+    expect(stale).toContain('This task’s summary was written 5 turns ago. Call updateTask')
+    // assistant-mode.md §5.18 ④: the title names what the task is doing now, the summary's first sentence its status.
+    expect(stale).toContain('a summary whose first sentence states its current status')
+    expect(stale).toContain(
+      'Its title names what it is doing now: if the work has moved on to something the title no longer names, give ' +
+        'it a new title with the summary.'
+    )
     expect(await turn()).toContain('written 6 turns ago')
     // A fresh summary starts the count again.
     await index.setSummary('bot-a', taskKey, { summary: 'Done.', now: 2 })
     expect(await turn()).toBeUndefined()
     expect((await index.get('bot-a', taskKey))?.turnsSinceSummary).toBe(1)
+    // A closed task is reminded of nothing and counts no turn.
+    await index.closeTask('bot-a', taskKey, 3)
+    expect(await turn()).toBeUndefined()
+    expect((await index.record('bot-a', taskKey))?.turnsSinceSummary).toBe(1)
+  })
+
+  it('tells a task in updateTask that its title names what it does now and its summary opens with its status', () => {
+    const description = UPDATE_TASK_TOOL.description
+    expect(description).toContain('The title names what the task is doing now')
+    expect(description).toContain('give it a new one')
+    expect(description).toContain('The summary’s first sentence states the current status on its own')
+    const props = UPDATE_TASK_TOOL.inputSchema.properties as Record<string, { description: string }>
+    expect(props.title!.description).toContain('What the task is doing now')
+    expect(props.summary!.description).toContain('The current status in its first sentence')
   })
 
   it('says nothing for a session that is no indexed task, or for a follow-up', async () => {
@@ -472,11 +513,12 @@ describe('a task’s summary reminder (auto-session-mode.md §6.7)', () => {
     const index = s.assistantSubsessions
     expect(await taskSummaryReminder(index, 'bot-a', taskKey)).toBeUndefined()
     const checkKey = sessionKey('slack', 'C0GENERAL', 'subsession:check-1', 'bot-a', 'slack:scope-1')
-    await index.openFollowUp({
+    await s.assistantWatchTasks.open({
       agentId: 'bot-a',
-      childSessionKey: checkKey,
-      parentSessionId: 'sid-1',
-      parentSessionKey: parentKey
+      taskKey: checkKey,
+      title: 'Watch the release',
+      origin: { platform: 'slack', channel: 'C0GENERAL', transportScope: 'slack:scope-1' },
+      owner: { sessionId: 'sid-1', key: parentKey }
     })
     for (let n = 0; n < 3; n++) expect(await taskSummaryReminder(index, 'bot-a', checkKey)).toBeUndefined()
   })

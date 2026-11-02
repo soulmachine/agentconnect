@@ -1,4 +1,5 @@
 // The coordinator session's prompt, tool surface and turn input (auto-session-mode.md §4, §5.4, §9); the runtime matrix probes these texts.
+import { READ_TASK_TOOL } from '../mcp/ops/assistant-subsessions.js'
 import { MEMORY_TOOL_ACCESS_MODES } from '../mcp/ops/memory.js'
 import { NO_RESPONSE_SENTINEL } from '../session/no-response.js'
 import { obj, type ToolDescriptor } from '../tool-schema/descriptor.js'
@@ -33,8 +34,15 @@ export interface CoordinatorPromptInput {
   webchat?: boolean
 }
 
+/** What a report's block names beside its id: the task it speaks for, by its `taskId`, kind and title. */
+export interface ReportAbout {
+  task?: string
+  kind?: string
+  title?: string
+}
+
 /** One delivered message as the coordinator reads it. */
-export interface CoordinatorMessage {
+export interface CoordinatorMessage extends ReportAbout {
   /** The message's {@link coordinatorMessageId}. */
   id: string
   /** The sender, as the platform names them. */
@@ -58,6 +66,7 @@ function placeWords(input: CoordinatorPromptInput) {
           `You coordinate the agent "${input.agentName}" in a private webchat conversation (${input.channelId}) ` +
           'with one person. Their messages are delivered to you, one per turn.',
         place: 'conversation',
+        taskLink: 'link',
         taskAnswers: 'on its own page, which the conversation links to',
         replyPosts: 'in the conversation',
         finalText:
@@ -70,6 +79,7 @@ function placeWords(input: CoordinatorPromptInput) {
           `${input.selfAddress ? ` Your ${input.platform} user is ${input.selfAddress}.` : ''} Channel messages are ` +
           'delivered to you, one or several per turn.',
         place: 'channel',
+        taskLink: 'thread link',
         taskAnswers: "in the message's thread",
         replyPosts: "in the message's thread",
         finalText: `Your final text is never shown to anyone. After your calls, end the turn with exactly ${NO_RESPONSE_SENTINEL}.`
@@ -86,9 +96,13 @@ const SEND_MESSAGE_DESCRIPTION =
   'thread, and "callAgent" asks the agent toAgent with message; its answer reaches you later as a report.'
 
 const LIST_TASKS_DESCRIPTION =
-  "List your open tasks: id, title, whether a thread is attached, owner, last activity, whether it is running, and the task's " +
-  'own summary (scope, status, next step) with when it was last updated. Use it to tell whether a message belongs to existing ' +
-  'work and to answer status questions.'
+  'List open work, the most recently changed first. "here" holds your own tasks in this conversation: taskId, title, ' +
+  "whether a thread is attached and its links, owner, last activity, whether it is running, and the task's own summary " +
+  '(status first, then scope and next step) with when it was last updated. "elsewhere" holds the open tasks of other ' +
+  'conversations the people asking may see, read only: id, place, title, status, summary and thread links. Entries ' +
+  'also name the message a task was opened for and the pull requests it opened. Each list holds at most 20; ' +
+  "pass a list's nextCursor, or the cursor a line of the work board names, as after to read on. Use it to tell " +
+  'whether a message belongs to work already open, here or elsewhere, and to answer status questions.'
 
 const str = (description: string) => ({ type: 'string', description })
 
@@ -125,16 +139,26 @@ export const COORDINATOR_SEND_MESSAGE_TOOL: ToolDescriptor = {
 export const COORDINATOR_LIST_TASKS_TOOL: ToolDescriptor = {
   name: 'listTasks',
   description: LIST_TASKS_DESCRIPTION,
-  inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false }
+  inputSchema: {
+    type: 'object',
+    properties: {
+      after: str('A nextCursor listTasks returned, or a cursor the work board names, to read on in that list.')
+    },
+    required: [],
+    additionalProperties: false
+  }
 }
 
-/** The coordinator's decision tools; memory tools join them in a daemon session (§5.4). */
+/** The coordinator's decision tools and its read of one task; memory tools join them in a daemon session (§5.4). */
 export function coordinatorTools(): ToolDescriptor[] {
-  return [COORDINATOR_SEND_MESSAGE_TOOL, COORDINATOR_LIST_TASKS_TOOL]
+  return [COORDINATOR_SEND_MESSAGE_TOOL, COORDINATOR_LIST_TASKS_TOOL, READ_TASK_TOOL]
 }
 
 // What the coordinator keeps for its place as assistant mode's long session: follow-ups, proposals and reminders (§3.4, §5.4).
 const PLACE_TOOLS = new Set(['followUp', 'getToKnow', 'propose', 'remind', 'listReminders', 'cancelReminder'])
+
+// Every agent's read of another of its conversations, judged by the batch's senders (assistant-mode.md §5.18 ④).
+const READ_TOOLS = new Set(['recall'])
 
 /** The place tools that act for one person's request, so in a batch each call names that person's message by `messageId`. */
 export const COORDINATOR_MESSAGE_TOOLS: ReadonlySet<string> = new Set(['followUp', 'getToKnow', 'remind'])
@@ -150,12 +174,16 @@ function placeTool(tool: ToolDescriptor): ToolDescriptor {
   }
 }
 
-/** A coordinator session's whole tool set: its decision tools, and the memory and place tools among the session's own. */
+/** A coordinator session's whole tool set: its decision tools, and the memory, `recall` and place tools among the session's own. */
 export function coordinatorSessionTools(tools: readonly ToolDescriptor[]): ToolDescriptor[] {
   return [
     ...coordinatorTools(),
     ...tools.flatMap((tool) =>
-      MEMORY_TOOL_ACCESS_MODES[tool.name] !== undefined ? [tool] : PLACE_TOOLS.has(tool.name) ? [placeTool(tool)] : []
+      MEMORY_TOOL_ACCESS_MODES[tool.name] !== undefined || READ_TOOLS.has(tool.name)
+        ? [tool]
+        : PLACE_TOOLS.has(tool.name)
+          ? [placeTool(tool)]
+          : []
     )
   ]
 }
@@ -176,8 +204,8 @@ export function coordinatorPrompt(input: CoordinatorPromptInput): string {
     '# You are the coordinator',
     `${words.intro} You never do the work ` +
       'yourself: you have no workspace, and you must not read files, run commands, search the web, or use any tool other ' +
-      'than sendMessage, listTasks and the memory, follow-up and reminder tools you are given. For every delivered message ' +
-      'you choose exactly one outcome:',
+      'than sendMessage, listTasks, readTask, recall and the memory, follow-up and reminder tools you are given. For ' +
+      'every delivered message you choose exactly one outcome:',
     '',
     '1. Hand it to an open task: sendMessage action "messageTask" with taskId and messageId. Use it when the message ' +
       `continues, adds to, or reports on work within an open task's scope. The task answers ${words.taskAnswers}.`,
@@ -186,17 +214,32 @@ export function coordinatorPrompt(input: CoordinatorPromptInput): string {
       'receives the original message verbatim, so do not restate it; put in message only background it cannot see.',
     '3. Reply yourself: sendMessage action "replyToMessage" with messageId and message, which posts a visible reply ' +
       `${words.replyPosts}. Use it only for what you can ` +
-      "answer in one or two sentences without any work: greetings, thanks, or a status question answered from a task's summary.",
+      "answer in one or two sentences without any work: greetings, thanks, a status question answered from a task's " +
+      'summary, or a request for work that is already open elsewhere.',
     '4. Ignore it: make no call for it. Use it when the message is not for you: conversation between people, a message ' +
       'addressed to someone else, or a request to another agent. Ignoring is silent: never reply to say a message is ' +
       'not for you or to explain why you are not acting.',
     '',
+    '# Open work',
+    'A turn may begin with the work board: "Here" lists the open tasks of this ' +
+      `${words.place} with their taskIds, "Elsewhere" the open tasks of other conversations that the people asking may ` +
+      'see, read only. It is sent again only when it changes, so the latest board you were given stands. listTasks ' +
+      'gives each task\'s summary: "here" your own tasks, "elsewhere" the other conversations\' tasks. readTask ' +
+      "reads one task's latest words, the message it was opened for and the pull requests it opened, without waking " +
+      'it, when its summary does not answer a question. recall reads what was said in another conversation.',
+    "A task's title names what it is doing now, which the task keeps current, and its summary's first sentence " +
+      'states its current status.',
+    'A task runs in one of two modes: work, which does what it is given, or watch, a follow-up, which checks ' +
+      'something on its schedule and reports only when it changes. Both are messaged and stopped by their taskId; a ' +
+      'follow-up shows "next" and the time of its next check, or "running" while a check runs.',
+    '',
     '# Reports',
     `A <report> is not a ${words.place} message: it is the result of a follow-up, a proposal or a task of yours, or another ` +
-      "agent's answer. When it carries something the people here should know, tell them with sendMessage action " +
-      '"replyToMessage" and the report\'s id, which posts where the report belongs; otherwise leave it. Never open a task ' +
-      'for a report or hand one to a task. To post anywhere else, use action "postMessage"; to ask another agent, use ' +
-      'action "callAgent".',
+      "agent's answer. It may arrive beside messages in one turn, naming the task it speaks for by task, kind and title; " +
+      'decide it on its own. When it carries something the people here should know, tell them with sendMessage action ' +
+      '"replyToMessage" and the report\'s id, which posts where the report belongs; otherwise leave it, silently. ' +
+      'Never open a task for a report or hand one to a task. To post anywhere else, use action "postMessage"; to ask ' +
+      'another agent, use action "callAgent".',
     '',
     '# Rules',
     '- Each call names its message by its id, copied exactly as a string, and each message gets at most one outcome.',
@@ -205,6 +248,11 @@ export function coordinatorPrompt(input: CoordinatorPromptInput): string {
       "call it with their message's id as messageId and reply to their message as well.",
     '- Before deciding, call listTasks once when a message might belong to existing work or asks about status.',
     "- Prefer handing a message to an open task over opening a second task in that task's scope.",
+    '- When a message asks for work that a task elsewhere already has open, do not open another: reply with what that ' +
+      `task is doing, from its summary, and point to its ${words.taskLink}. Never message or stop a task from elsewhere.`,
+    '- This session may run under a read-only or plan permission mode. It restricts native file and shell tools only: ' +
+      'sendMessage, listTasks and your other AgentConnect tools are your outputs, so call them directly. Never write a ' +
+      'plan or ask for approval; no one is here to approve one.',
     peersLine(input, words.place),
     `- ${words.finalText}`
   ].join('\n')
@@ -215,14 +263,23 @@ const framed = (text: string): string => text.replace(/<\/(message|report)>/gi, 
 
 const counted = (n: number, one: string, many: string): string => (n === 1 ? `One ${one}` : `${n} ${many}`)
 
-/** One coordinator turn's input: the delivered messages, each with its id, sender and whether it mentions the agent, and the reports. */
+// A title cannot close its attribute or the tag.
+const attr = (value: string): string =>
+  value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+const aboutAttrs = (about: ReportAbout): string =>
+  (['task', 'kind', 'title'] as const)
+    .flatMap((name) => (about[name] ? [` ${name}="${attr(about[name])}"`] : []))
+    .join('')
+
+/** One coordinator turn's input: the delivered messages, each with its id, sender and whether it mentions the agent, and the reports with the task each speaks for. */
 export function renderCoordinatorBatch(
   messages: readonly CoordinatorMessage[],
   at: { channelId: string; channelName?: string; webchat?: boolean }
 ): string {
   const blocks = messages.map((message) =>
     message.report
-      ? `<report id="${message.id}">\n${framed(message.text)}\n</report>`
+      ? `<report id="${message.id}"${aboutAttrs(message)}>\n${framed(message.text)}\n</report>`
       : `<message id="${message.id}" from="${message.from}" mentions-you="${message.mentionsYou ? 'yes' : 'no'}"` +
         `${message.thread ? ` thread="${message.thread}"` : ''}>\n${framed(message.text)}\n</message>`
   )

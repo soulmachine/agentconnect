@@ -3,6 +3,7 @@ import { SLACK_CODE_MODEL_KEY, SLACK_CODE_CONTEXT_KEY } from '@agentconnect.md/p
 import { parseArgs } from '../../mcp/ops/args.js'
 import type { SessionContext } from '../../mcp/ops/context.js'
 import { buildAttributionBlocks } from '../../slack/render.js'
+import { sessionKey } from '../../store/local-store.js'
 import type { SlackConnection } from '../../slack/connection.js'
 import type { ToolDescriptor } from '../../tool-schema/descriptor.js'
 import type { PlatformSessionTools, PlatformSessionToolEnv } from '../read-ports.js'
@@ -12,6 +13,7 @@ const text = z.string().trim().min(1)
 const reportArgs = z
   .object({
     title: text.max(150),
+    summary: z.array(text.max(1000)).min(1).max(6).optional(),
     sections: z
       .array(z.object({ title: text.max(150), text: text.max(3000), collapsed: z.boolean().optional() }))
       .max(10)
@@ -34,12 +36,20 @@ const reportArgs = z
       .optional()
   })
   .strict()
-  .refine((a) => a.sections?.length || a.table, 'Supply at least one section or table')
+  .refine((a) => a.summary?.length || a.sections?.length || a.table, 'Supply a summary, section or table')
 
 // Slack's table limit includes every cell, including column headings.
 export function slackReport(args: z.infer<typeof reportArgs>): { blocks: unknown[]; text: string } {
   const blocks: unknown[] = [{ type: 'header', text: { type: 'plain_text', text: args.title } }]
   const fallback = [args.title]
+  if (args.summary?.length) {
+    const summary = args.summary.map((text) => ({ type: 'section', text: { type: 'mrkdwn', text } }))
+    const rows = []
+    for (let i = 0; i < summary.length; i += 3)
+      rows.push({ items: summary.slice(i, i + 3).map((block) => ({ block })) })
+    blocks.push({ type: 'layout', label: args.title, rows, fallback: summary })
+    fallback.push(...args.summary)
+  }
   for (const section of args.sections ?? []) {
     blocks.push({
       type: 'container',
@@ -81,7 +91,7 @@ export function slackReport(args: z.infer<typeof reportArgs>): { blocks: unknown
 const descriptor: ToolDescriptor = {
   name: 'presentSlackReport',
   description:
-    'Publish substantial findings or multi-row comparisons in this Slack conversation with native collapsible sections and a sortable, paginated data table. Choose this when the results benefit from expandable details or sorting, even if the user did not request a format. Use sections.text as Slack mrkdwn. String cells are plain text; numeric cells sort numerically. Keep short answers and small tables in ordinary replies. This posts immediately; do not repeat the report in your final reply.',
+    'Publish substantial findings or multi-row comparisons in this Slack conversation with a multi-column summary, collapsible details and a sortable, paginated data table. Choose this when parallel facts, expandable details or sorting help the reader, even if the user did not request a format. Use optional summary for up to six short facts or metrics and sections for longer details; both accept Slack mrkdwn. String table cells are plain text; numeric cells sort numerically. Keep short answers and small tables in ordinary replies. This posts immediately; do not repeat the report in your final reply.',
   inputSchema: z.toJSONSchema(reportArgs, { unrepresentable: 'any' }) as ToolDescriptor['inputSchema']
 }
 
@@ -192,20 +202,26 @@ async function execute(
   const conn = env.connection as SlackConnection
   if (name === 'createSlackCodeChannel') {
     const a = parseArgs(createArgs, args)
+    const here = env.deliveryChannel
     const origin = env.originMsgId?.split(':')
-    if (origin?.length !== 3 || origin[0] !== 'slack' || origin[1] !== ctx.channel || !/^\d+\.\d+$/.test(origin[2]!))
+    if (origin?.length !== 3 || origin[0] !== 'slack' || origin[1] !== here || !/^\d+\.\d+$/.test(origin[2]!))
       throw new Error('A code channel requires a live Slack message as its origin')
-    const created = await createCodeChannel(
-      conn,
-      { agentId: ctx.agentId, channel: ctx.channel, ts: origin[2]!, isDm: ctx.isDm },
-      a.name,
-      () => env.judgeWrite({ kind: 'new', platform: ctx.platform, integrationId: ctx.integrationId, users: [] })
-    )
-    return created.response
+    const make = async () => {
+      const created = await createCodeChannel(
+        conn,
+        { agentId: ctx.agentId, channel: here, ts: origin[2]!, isDm: ctx.isDm && here === ctx.channel },
+        a.name,
+        () => env.judgeWrite({ kind: 'new', platform: ctx.platform, integrationId: ctx.integrationId, users: [] })
+      )
+      // A code channel's one session keys on the channel itself (slack-code-channels.md), the coordinate a task holds it by.
+      const id = created.existing ? undefined : created.channelId
+      return { result: created.response, ...(id ? { room: { channel: id, thread: id } } : {}) }
+    }
+    return env.makeRoom ? await env.makeRoom(make) : (await make()).result
   }
   if (name === 'setSlackCodeView' || name === 'manageSlackCodeChannel') {
     const a = name === 'setSlackCodeView' ? parseArgs(viewArgs, args) : parseArgs(manageArgs, args)
-    const channel = a.channelId ?? ctx.channel
+    const channel = a.channelId ?? env.deliveryChannel
     await env.judgeWrite({ kind: 'conversation', platform: ctx.platform, integrationId: ctx.integrationId, channel })
     const info = await conn.codeChannel(channel)
     if (!info.code || !info.owners.includes(conn.botUserId))
@@ -233,15 +249,12 @@ async function execute(
       if (!updated) throw new Error('This bot does not own that Slack code channel')
       return { ok: true }
     }
-    if (a.action === 'archive') {
-      await conn.closeCodeSession(channel)
-      const archived = await conn.codeChannelApi('archive', {
-        channel_id: channel,
-        summary_message_ts: a.summaryMessageTs
-      })
-      conn.codeChannelArchived(channel)
-      return archived
-    }
+    if (a.action === 'archive')
+      return conn.archiveCodeChannel(
+        channel,
+        a.summaryMessageTs,
+        sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
+      )
     if (a.action === 'removeView') return conn.codeChannelApi('removeView', { channel_id: channel, view_id: a.viewId! })
     return conn.codeChannelApi('listViews', { channel_id: channel })
   }
@@ -251,11 +264,11 @@ async function execute(
     kind: 'conversation',
     platform: ctx.platform,
     integrationId: ctx.integrationId,
-    channel: ctx.channel
+    channel: env.deliveryChannel
   })
   const attribution = await env.attribution?.()
   const ts = await (env.connection as SlackConnection).postBlocks(
-    ctx.channel,
+    env.deliveryChannel,
     [...report.blocks, ...(attribution ? buildAttributionBlocks(attribution).blocks : [])],
     report.text,
     env.deliveryThread,
@@ -263,7 +276,7 @@ async function execute(
   )
   if (!ts) throw new Error('Slack did not post the report; its originating thread may have been deleted')
   await env.recordPost(report.text, ts)
-  return { channel: ctx.channel, ts }
+  return { channel: env.deliveryChannel, ts }
 }
 
 export const SLACK_SESSION_TOOLS: PlatformSessionTools = {

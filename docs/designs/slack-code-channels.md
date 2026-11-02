@@ -2,16 +2,23 @@
 
 ## Reports
 
-Slack sessions expose `presentSlackReport` for substantial findings and comparisons. Sections
-use native collapsible Container blocks; tables use Data Table blocks with pagination
+Slack sessions expose `presentSlackReport` for substantial findings and comparisons. An optional
+summary places up to six short facts in native Layout blocks, with up to three columns per row.
+Slack stacks them on mobile; older clients receive ordinary section blocks in the same order.
+Sections use native collapsible Container blocks; tables use Data Table blocks with pagination
 and numeric sorting. Ordinary replies retain Markdown, including Markdown tables.
-Sections accept Slack mrkdwn, while table strings are plain text. The tool validates
+Summary items and sections accept Slack mrkdwn, while table strings are plain text. The tool validates
 row widths and message limits before posting. Reports use the current turn's physical
 delivery thread and the configured agent identity and attribution.
 They carry finalized authorship with the live turn's hop count and enter the normal
 outbound transcript. A headless or ended turn cannot publish through this surface.
-The agent chooses this format when expandable details or sortable rows help the reader;
+The agent chooses this format when parallel facts, expandable details or sortable rows help the reader;
 the user does not need to name the tool or request a particular format.
+
+The shared `readCanvas` tool reads the complete Markdown body through `canvases.getContent`,
+alongside file metadata and fresh heading anchors for edits. A failed content read is reported
+as a failure; an empty canvas has an empty Markdown body. It requires the existing
+`canvases:read` and `files:read` grants.
 
 ## Code channels
 
@@ -33,7 +40,9 @@ an actual thread reply's parent as `replyThread`: reply bodies, streams and file
 return there, while a top-level request receives a top-level response. Native status,
 renames and views remain channel-scoped and omit `thread_ts`. Native Stop without a
 thread timestamp addresses the same channel coordinate on both ingress transports.
-History reads use channel history.
+History reads use channel history. A root post the agent makes in a code channel, such as
+its wrap-up, belongs to that same session: the gateway's `roomThread` names the channel as
+the post's thread, so the post is recorded there and seeds no second session.
 
 The console groups these conversations under Code channels, below direct messages and collapsed by default,
 without per-row trigger or session-mode controls. Membership snapshots carry the
@@ -44,7 +53,9 @@ Archiving ends the channel session. The agent's archive first marks the session
 `closed` (Slack's _Done_), then archives with the optional summary. When a person
 archives the channel instead, `channel_archive` / `group_archive` arrive on either
 transport at the channel coordinate: all sessions and delegated tasks sharing the
-channel are cancelled. Either archive also closes the coordinator task the channel
+channel are cancelled. The agent's own archive raises the same events, which cancel every
+session sharing the channel except the one whose turn archived it: that turn ends by
+itself once its wrap-up is posted. Either archive also closes the coordinator task the channel
 holds (below). The relay forwards an archive as a Stop marked `archived`, because a
 native Stop without a thread timestamp reaches the same channel coordinate. Native Stop
 keeps its existing displayed-owner behavior on Socket Mode and closes no task. An
@@ -59,35 +70,33 @@ Other bots do not acquire implicit activation from this field.
 ## Coordinator tasks
 
 In an Auto conversation ([auto-session-mode.md](auto-session-mode.md) §6.8), a task the
-coordinator opens with `delegateTask` for a message works in a code channel linked to that
-message instead of in the message's thread. The daemon reaches it through the optional
-`openTaskPlace` member of its platform contract, which the Slack connection implements with
-the same creation path `createSlackCodeChannel` uses: the origin link, the origin-derived
-idempotency key, Slack's privacy match and the author's invite. Only a sender who is a full
-member of the workspace has a channel made, as the tool requires an eligible human asker.
+coordinator opens with `delegateTask` for a message works in the message's thread, as on every
+platform. It moves into a code channel only when it makes one for its work with
+`createSlackCodeChannel`, under the tool's own rules below; the coordinator never asks for one.
 
-- The task's session is the channel session, and the task holds the channel coordinate as
-  its thread. The coordinator links the channel in the message's thread.
-- Slack's copy of the request opens the task: it reaches that session, never a second one.
-  A code channel message that arrives while the channel is still being made waits for it, so
-  the copy runs once the task is indexed, and the copy, from the request's own sender within
-  10 minutes, carries the coordinator's title and background.
+- The task keeps its session, and holds the channel coordinate as one more thread beside the
+  message's thread. A message in the channel reaches the task and is answered there; the
+  message's thread is still answered in place. The task's own reply says where it moved.
+- Slack's copy of the request reaches the task through the channel, never a second session. A
+  code channel message that arrives while the channel is still being attached waits for it,
+  at most 30 seconds.
 - A code channel has no root, so under Auto it never runs a coordinator of its own: every
   message there keys on the channel session, the task's while one holds it. A code channel
   made outside a task, or whose task has closed, stays an ordinary channel session.
 - A message the coordinator hands the task later moves into the channel, and its thread gets
   a link.
+- At the end of each run in the channel the task reports to its coordinator with the run's final
+  output and its summary after it, and the coordinator may relay it in the message's thread.
 - Archiving the channel closes the task. So do 7 idle days, and its coordinator's
   conversation leaving Auto.
-- Without code channels, when creation fails, or when the sender may not make a channel, the
-  task stays in the message's thread with no further notice. Background tasks (no
-  `messageId`) and the coordinator's fallback tasks never use a code channel.
+- A thread session adopted on a switch into Auto holds no channel it makes: that channel gets
+  its own session, as outside a task.
 
 ## Agent tools
 
 The platform-owned session tool registry exposes four tools only to Slack sessions:
 
-- `presentSlackReport`: publish collapsible sections and a paginated table here.
+- `presentSlackReport`: publish parallel summary facts, collapsible sections and a paginated table here.
 - `createSlackCodeChannel`: create a task channel linked to the current live triggering
   message. Slack matches origin privacy and invites its author. An origin-derived
   idempotency key prevents duplicate channels when a call is retried. Creation inside
@@ -128,7 +137,8 @@ to stay in the original conversation or the task needs earlier discussion that t
 originating message does not contain; quick answers stay in place. This platform
 workflow takes precedence over delegating the same work to a background task.
 Creation leaves the current runtime turn in its original conversation. Slack brings
-the originating request into the new channel, whose session continues the task. The
+the originating request into the new channel, whose session continues the task: the
+channel's own, or the task's own where a coordinator's task made it (Coordinator tasks). The
 original turn links the channel and ends without repeating the work or requiring
 the user to repeat the request. No additional transcript history is copied. Work
 that needs the existing context, or cannot create a channel, is handled as it would be
@@ -139,9 +149,30 @@ Channel discovery supplies standing context identifying an existing code channel
 The agent continues work there, maintains repository/branch/PR context items, and
 publishes PR views when opened and useful HTML previews.
 The agent does not auto-archive a channel at the end of a turn.
-Views initially cover diffs, HTML and PR links, plus the Plan tab below. Arbitrary
+Views cover diffs, HTML and PR links, plus the Plan and Tasks tabs below. Arbitrary
 interactive Block Kit views and runtime-registered slash commands are follow-up
 capabilities.
+
+### Tasks
+
+The daemon maintains one `Tasks` Block Kit view (`agentconnect-tasks`) for the channel's
+session. It reads the same parent-scoped task ledger and runtime background-task snapshot
+as the console's Tasks panel: Tasks, Follow-ups, Subagents and Commands. Ordinary foreground
+tool calls remain in the response's work steps. Unreported runtime tasks are shown as
+unavailable, not as evidence that no background work exists.
+
+Open work stays visible; finished work shares a collapsed container. Waiting follow-ups and
+threaded tasks remain open, matching the console. Running work refreshes every five seconds,
+including after the main response ends; waiting work refreshes every twenty seconds. Idle
+views stop polling once all work has finished and refresh again on the next turn. Channel
+archive and connection shutdown cancel pending updates. Every read checks the channel owner,
+session binding and conversation access, and masks configured secrets before rendering.
+
+The view shows a bounded snapshot and links to the console for further history and task
+controls. Runtime subagents and commands stay read-only, as in the console: reporting a task
+does not imply an individual cancellation API. No agent tool call is needed to publish tasks.
+
+### Plan
 
 The Plan tab is written by the daemon, not by a tool. In a code channel this bot owns,
 each ACP `plan` update is rendered as a markdown checklist and kept in a canvas
@@ -185,5 +216,7 @@ The Control Plane continues to hold control metadata only.
 - [Slack Code](https://docs.slack.dev/ai/slack-code/)
 - [Code channel properties](https://docs.slack.dev/ai/slack-code/code-channel-properties/)
 - [Container block](https://docs.slack.dev/reference/block-kit/blocks/container-block/)
+- [Layout block](https://docs.slack.dev/reference/block-kit/blocks/layout-block/)
 - [Data Table block](https://docs.slack.dev/reference/block-kit/blocks/data-table-block/)
+- [Canvas content](https://docs.slack.dev/reference/methods/canvases.getContent/)
 - [Code channel views](https://docs.slack.dev/reference/methods/agents.conversations.setView/)

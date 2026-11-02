@@ -56,6 +56,8 @@ the picture it draws.
 ### Webchat and console
 
 - **(proposal)** [ahp-adoption.md](designs/ahp-adoption.md) — An open AHP v1 interface for third-party clients: separate legacy/AHP services, feature switches, interoperability, and gateway reuse.
+- **(proposal)** [ahp-repository-picker.md](designs/ahp-repository-picker.md) — Choose an agent's repository from an AHP client's folder picker: a virtual repository namespace over `resourceList`, `defaultDirectory`, and the chosen folder as the session's repository pin.
+- **(proposal)** [ahp-client-sign-in.md](designs/ahp-client-sign-in.md) — Browser sign-in for AHP clients such as VS Code through the CP OAuth server: an `ahp` scope, per-agent resource binding, and token refresh on a live connection.
 - [webchat-multi-agents.md](designs/webchat-multi-agents.md) — Multi-agent webchat conversations: roster, primary agent, activation.
 - [webchat-generated-images.md](designs/webchat-generated-images.md) — Runtime-generated workspace images, explicit publication through `shareFile`, and retained inline previews in webchat.
 - [webchat-side-panels.md](designs/webchat-side-panels.md) — The session-detail right dock.
@@ -124,7 +126,7 @@ the picture it draws.
 - [agent-reachability-graph.md](designs/agent-reachability-graph.md) — Which agents can reach which: the reachability graph.
 - [preset-agents.md](designs/preset-agents.md) — Preset agents and guided onboarding.
 - [agent-assistant.md](designs/agent-assistant.md) — The AgentConnect MCP: system operations for AI tools.
-- [assistant-mode.md](designs/assistant-mode.md) — Assistant mode: one long conversation per place, one shared mind, external places detected by the platform, background tasks and follow-ups.
+- [assistant-mode.md](designs/assistant-mode.md) — Assistant mode: one long conversation per place, one shared mind, external places detected by the platform, background tasks and follow-ups; §5.18 proposes the work board that shows each coordinator the agent's open work.
 - [capability-requests.md](designs/capability-requests.md) — Capability requests: an agent asks for a setting, tool, repository, connection or secret it lacks, a person completes it in the console, and the conversation resumes.
 - [agent-capability-benchmark-harness.md](designs/agent-capability-benchmark-harness.md) — Add-on evaluation and harness neutrality.
 

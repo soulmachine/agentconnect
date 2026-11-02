@@ -343,6 +343,22 @@ export const canonicalColumns = [
   // assistant_subsession's task model (auto-session-mode.md §6)
   'summaryUpdatedAt',
   'turnsSinceSummary',
+  // the work board's order and its placed rows (assistant-mode.md §5.18)
+  'changedAt',
+  // a watch task's schedule (assistant-mode.md §5.18)
+  'nextAt',
+  // a closed task's record, what it was opened for and what it opened (assistant-mode.md §5.18 ④)
+  'closedAt',
+  'openedForPlace',
+  'openedForMessage',
+  'openedAt',
+  'watchStatus',
+  'ownerPlatform',
+  'ownerChannel',
+  'ownerTransportScope',
+  'ownerConversationKind',
+  'taskSessionId',
+  'taskTitle',
   'sinceRound',
   'attachedAt',
   'submissionId',

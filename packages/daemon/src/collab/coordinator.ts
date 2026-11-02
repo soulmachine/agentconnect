@@ -1,9 +1,12 @@
 // Agent-to-agent collaboration (A2A wake/reply/status): every delivery is DIRECT, never a visible post, and its CAS and admission orderings are load-bearing.
 import { isAppendCoordinate } from '../session/append-coordinate.js'
 import { deriveTitle } from '../session/derive-title.js'
+import { readCheckedTask } from '../assistant/checked-tasks.js'
+import { wholeRoomThread } from '../auto-session/coordinator-turns.js'
 import { subsessionLabel } from '../permissions/subsession-approval.js'
 import {
   SUBSESSION_COORDINATE_PREFIX,
+  isCheckCoordinate,
   isDelegatedTaskKey,
   isDelegationCoordinate,
   isResearchCoordinate,
@@ -62,7 +65,8 @@ import {
   sdkLeaseKey,
   type CallMeta,
   type Pending,
-  type QueueEntry
+  type QueueEntry,
+  type ReportTask
 } from '../daemon/turn-types.js'
 import type {
   ContinueSubsessionReq,
@@ -286,6 +290,29 @@ function endReason(end: Pick<SubsessionTurnEnd, 'outcome' | 'reason'>): string {
       : (end.reason ?? 'interrupted')
 }
 
+/** What a task holding a room reports to its coordinator at the end of a run there: the run's final output, which the coordinator may relay in the origin thread (auto-session-mode.md §6.8). */
+export function roomRunReport(
+  outcome: 'completed' | 'failed',
+  label: string | null | undefined,
+  output: string | undefined,
+  summary: string | undefined,
+  link: string | undefined
+): { text: string; shown: ShownInput } {
+  const task = taskName(label, 'Task')
+  const where = link ? `in its channel (${link})` : 'in its channel'
+  // The task's own account, stale when it did not update it, so it only follows the result.
+  const notes = summary?.trim() ? [`Its summary: ${summary.replace(/\s+/g, ' ').trim()}`] : []
+  if (outcome === 'completed' && output) {
+    const frame = `[task run] ${task} ended a run ${where}. Its final output, delivered on its behalf:`
+    return { text: [frame, output, ...notes].join('\n\n'), shown: { text: output, notes: [frame, ...notes] } }
+  }
+  const status =
+    outcome === 'completed'
+      ? `[task run] ${task} ended a run ${where} without a final output; any reply it posted there is its result.`
+      : `[task run] ${task} stopped ${where} before finishing (error). Anything it posted there is all it reported.`
+  return { text: [status, ...notes].join(' '), shown: { text: status, notes } }
+}
+
 /** The one short report an approved proposal that ended without its own gets in its owning session; a follow-up's check settles on its own path. */
 export function subsessionEndReport(end: Pick<SubsessionTurnEnd, 'outcome' | 'reason'>, label?: string | null): string {
   const tail = 'It sent no result; delegate a task if the work is still needed.'
@@ -495,7 +522,7 @@ export class CollabCoordinator {
   private readonly subsessionAdmitting = new Map<string, number>()
   // The latest round a parent message joined (not opened) and the child accepted, per sub-session.
   private readonly subsessionJoinedRound = new Map<string, number>()
-  // A delegated sub-session's latest final output, which its round-end report carries (send-message-guide.md §8.5).
+  // A delegated sub-session's latest final output for its round-end report (send-message-guide.md §8.5), a held room's for its run report.
   private readonly subsessionFinalOutputs = new Map<string, { round?: number | undefined; text: string }>()
   // Submissions being admitted right now, so a concurrent replay of one waits for its receipt instead.
   private readonly subsessionSubmissions = new Set<string>()
@@ -623,7 +650,7 @@ export class CollabCoordinator {
     if (!isSubsessionCoordinate(thread)) return true
     const index = this.host.store().assistantSubsessions
     const row = await index.get(agentId, key)
-    if (row === undefined || row.kind === 'follow-up') return false
+    if (row === undefined || row.mode === 'watch') return false
     return !(await this.isTaskKey(agentId, row.parentSessionKey))
   }
 
@@ -681,7 +708,7 @@ export class CollabCoordinator {
     return await this.withSubsessionReportLock(key, async () => {
       const index = this.host.store().assistantSubsessions
       const row = await index.get(req.callerAgentId, key)
-      const ended = rounds && row?.kind !== 'follow-up' ? row !== undefined && row.state !== 'open' : undefined
+      const ended = rounds && row?.mode !== 'watch' ? row !== undefined && row.state !== 'open' : undefined
       if (ended ?? (row?.state === 'failed' || row?.state === 'reporting')) {
         this.host.log().info(`sub-session ${key}: a report after its end was already reported is not delivered`)
         return { delivered: false, inReplyTo: answered.messageId, reason: TASK_ENDED }
@@ -788,6 +815,13 @@ export class CollabCoordinator {
     } catch (err) {
       this.host.log().warn(`sub-session ${key}: could not settle its round: ${formatErr(err)}`)
     }
+  }
+
+  /** The final output the turn of `key` that just ended left for its report, taken once (auto-session-mode.md §6.8). */
+  takeFinalOutput(key: string): string | undefined {
+    const stashed = this.subsessionFinalOutputs.get(key)
+    this.subsessionFinalOutputs.delete(key)
+    return stashed?.text
   }
 
   /** A task's label as its cards and listTasks name it: its session's title; null when it has none. */
@@ -1049,6 +1083,7 @@ export class CollabCoordinator {
       ? await store.ensureOutwardSessionId(callerKey, agentId, this.host.clock().now())
       : undefined
     const externalOrigin = await this.host.externalOriginForSession(agentId, callerKey)
+    const reportOf = await this.reportTaskOf(agentId, callerKey, caller.thread)
     // The lineage `replyToSession` gives a report: from the sub-session, one hop past the turn it continues.
     const callMeta: CallMeta = {
       callFrom: agentId,
@@ -1061,6 +1096,7 @@ export class CollabCoordinator {
       ),
       originCoords: { platform: caller.platform, channel: caller.channel, thread: caller.thread },
       ...(report.gettingToKnow !== undefined ? { gettingToKnowReport: report.gettingToKnow } : {}),
+      ...(reportOf ? { reportOf } : {}),
       // The session it opens is the place's own root, never the reporting sub-session's child, which is the place's.
       ...(opening ? { opensPlace: true as const } : {}),
       ...(externalOrigin ? { externalOrigin } : {}),
@@ -1141,6 +1177,31 @@ export class CollabCoordinator {
     }
     this.host.log().info(`sub-session report: ${agentId} → ${parent.key} delivery=${deliveryId}`)
     return { admitted: true }
+  }
+
+  /** The task a report speaks for, by its sub-session's key and coordinate, named as `listTasks` names it (assistant-mode.md §5.18 ④). */
+  private async reportTaskOf(agentId: string, key: string, thread: string): Promise<ReportTask | undefined> {
+    const store = this.host.store()
+    if (isCheckCoordinate(thread)) {
+      const watchTasks = store.assistantWatchTasks
+      const item = await readCheckedTask({ watchTasks, items: store.assistantItems }, agentId, key).catch(
+        () => undefined
+      )
+      return item && { taskId: key, kind: item.gettingToKnow ? 'getting to know' : 'follow-up', title: item.title }
+    }
+    const row = await store.assistantSubsessions.get(agentId, key).catch(() => undefined)
+    // A threaded task reports only a run in a room it holds (auto-session-mode.md §6.8).
+    if (!isSubsessionCoordinate(thread))
+      return row && row.mode !== 'watch'
+        ? { taskId: key, kind: 'delegated task', ...(row.title ? { title: row.title } : {}) }
+        : undefined
+    const title = subsessionLabel(row?.title, undefined)
+    const kind = isTaskCoordinate(thread)
+      ? 'approved proposal'
+      : isResearchCoordinate(thread)
+        ? 'research'
+        : 'delegated task'
+    return { taskId: key, kind, ...(title ? { title } : {}) }
   }
 
   /** An agent→agent delivery's body, delivery id and thread; the receiving daemon frames the body with its message header (§9.5). */
@@ -2110,13 +2171,14 @@ export class CollabCoordinator {
     callMeta: CallMeta | undefined,
     p: { reply: { text: string }; outputSuppressed?: string | undefined }
   ): Promise<void> {
-    // send-message-guide.md §8.5: a delegated sub-session's output rides its round-end report instead.
-    if (isDelegationCoordinate(sessionThreadOf(msg))) {
+    const delegated = isDelegationCoordinate(sessionThreadOf(msg))
+    // send-message-guide.md §8.5: a delegated sub-session's output rides its round-end report instead, a held room's run its run report.
+    if (delegated || (msg.sessionChannel !== undefined && wholeRoomThread(msg))) {
       const output = p.outputSuppressed ? '' : p.reply.text.trim()
       if (output && !isNoResponseBody(output))
         this.subsessionFinalOutputs.set(childKey, { round: callMeta?.subsessionRound, text: output })
       else this.subsessionFinalOutputs.delete(childKey)
-      return
+      if (delegated) return
     }
     if (this.host.draining()) return
     if (p.outputSuppressed) return
@@ -2271,7 +2333,7 @@ export class CollabCoordinator {
     const source = await this.host.store().getSessionByOutwardId(answered.sourceSessionId, agentId)
     if (!source || !isDelegationCoordinate(source.thread)) return false
     const row = await this.host.store().assistantSubsessions.get(agentId, source.key)
-    return row !== undefined && row.kind !== 'follow-up' && row.parentSessionKey === callerKey
+    return row !== undefined && row.mode !== 'watch' && row.parentSessionKey === callerKey
   }
 
   /** §8.2: an owning session's reply into its own task is admitted exactly like `messageTask`. */
@@ -2304,7 +2366,7 @@ export class CollabCoordinator {
   ): Promise<{ row: AssistantSubsession; caller: DaemonReportCaller } | undefined> {
     const store = this.host.store()
     const row = await this.indexedSubsession(agentId, id)
-    if (!row || row.kind === 'follow-up' || row.parentSessionKey !== callerKey) return undefined
+    if (!row || row.mode === 'watch' || row.parentSessionKey !== callerKey) return undefined
     // The recorded parent, by outward id too: a rotated or recreated caller session is not the one that opened it.
     if (!(await store.getSession(callerKey))) return undefined
     const callerId = await store.ensureOutwardSessionId(callerKey, agentId, this.host.clock().now())
@@ -2333,7 +2395,7 @@ export class CollabCoordinator {
     if (!mayOpenTasksAt(req.callerThread)) return notFound()
     // A follow-up is owned by its place, which the host judges (assistant-mode.md §5.12).
     const indexed = await this.indexedSubsession(agentId, req.sessionId)
-    const followUp = indexed?.kind === 'follow-up' && this.host.messageFollowUp ? indexed : undefined
+    const followUp = indexed?.mode === 'watch' && this.host.messageFollowUp ? indexed : undefined
     const owned = followUp ? undefined : await this.ownedSubsession(agentId, req.sessionId, callerKey)
     if (!followUp && !owned) return notFound()
     // auto-session-mode.md §5.1: a session that delegates no task still messages its research, never a delegated task.
@@ -2386,12 +2448,13 @@ export class CollabCoordinator {
     }
   }
 
-  /** One of the agent's indexed sub-sessions, by its key or its session's outward id. */
+  /** One of the agent's indexed sub-sessions, by its key, a unique prefix of it, or its session's outward id. */
   private async indexedSubsession(agentId: string, id: string): Promise<AssistantSubsession | undefined> {
     const store = this.host.store()
     const index = store.assistantSubsessions
+    const key = await index.resolve(agentId, id)
     return (
-      (await index.get(agentId, id)) ??
+      (key !== undefined ? await index.get(agentId, key) : undefined) ??
       (await store
         .getSessionByOutwardIdOnly(id, agentId)
         .then((child) => (child ? index.get(agentId, child.key) : undefined)))
@@ -2639,7 +2702,7 @@ export class CollabCoordinator {
       if (!isDelegationCoordinate(local.thread)) return { delivered: false, inReplyTo, reason: 'not_authorized' }
       const row = await store.assistantSubsessions.get(local.agentId, local.key)
       // §8.2: the owner answering its own task is messaging it; any other session's reply is delivered like a peer's.
-      if (row && row.kind !== 'follow-up' && row.parentSessionKey === callerKey)
+      if (row && row.mode !== 'watch' && row.parentSessionKey === callerKey)
         return await this.replyIntoTask(req, answered, local.key)
     }
     const replierSessionId = callerRec

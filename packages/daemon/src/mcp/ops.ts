@@ -29,7 +29,12 @@ import { z, type ZodType } from 'zod'
 import type { AskDeps } from './ask.js'
 import type { InterceptedPost } from '../assistant/drafts.js'
 import type { ReplyAttributionInfo } from '../messages/attribution.js'
-import { allAttachmentReadTools, isAttachmentReadTool, sessionToolOwner } from '../platforms/read-ports.js'
+import {
+  allAttachmentReadTools,
+  isAttachmentReadTool,
+  sessionToolOwner,
+  type PlatformSessionToolEnv
+} from '../platforms/read-ports.js'
 import type { SessionContext, ToolHandler } from './ops/context.js'
 import { isGettingToKnowCoordinate, isCheckCoordinate, isResearchCoordinate } from '../session/subsession-coordinate.js'
 import { isCoordinatorCoordinate } from '../session/append-coordinate.js'
@@ -164,6 +169,7 @@ import {
 } from './ops/place-gate.js'
 import { resolveChannelArg } from './ops/channel-names.js'
 import { recall, RECALL_ARGS } from './ops/recall.js'
+import { readTask, type TaskReadDeps } from './ops/read-task.js'
 import { askingToJoin, parkingOnJoin, type JoinAskDeps, type JoinParked } from './ops/join-ask.js'
 import { ASSISTANT_ITEM_ARG_SCHEMAS, ASSISTANT_ITEM_HANDLERS, type AssistantItemDeps } from './ops/assistant-items.js'
 import { GETTING_TO_KNOW_ARGS, gettingToKnow } from './ops/getting-to-know.js'
@@ -234,6 +240,7 @@ export interface OpsDeps
     AssistantItemDeps,
     AssistantReminderDeps,
     AssistantSubsessionDeps,
+    TaskReadDeps,
     CapabilityRequestDeps,
     ChoiceCardOpsDeps {
   /** Rejected tool arguments are logged here at debug, key names only — the sole trace of them (#1921). */
@@ -248,6 +255,8 @@ export interface OpsDeps
   /** This turn's footer identity for a session tool that publishes agent-authored text
    *  (Linear's `createIssueComment`). Undefined when the agent's footer chrome is off. */
   sessionToolAttributionFor?: (ctx: SessionContext) => Promise<ReplyAttributionInfo | undefined>
+  /** Make a room for the session's work, which a task holds as one more thread (auto-session-mode.md §6.8). */
+  sessionToolRoomFor?: (ctx: SessionContext) => PlatformSessionToolEnv['makeRoom']
   /** Collaboration Arena §6: resolve + execute an evaluation-registry tool.
    *  Returns undefined when `name` is not an evaluation tool. Visibility and
    *  role-aware authorization live behind this seam (the daemon guarantees
@@ -347,6 +356,7 @@ const HANDLERS: Map<string, ToolHandler<OpsDeps>> = new Map<string, ToolHandler<
   ['readCanvas', readCanvas],
   ['updateCanvas', updateCanvas],
   ['recall', recall],
+  ['readTask', readTask],
   ...ASSISTANT_ITEM_HANDLERS,
   ['getToKnow', gettingToKnow],
   ...ASSISTANT_REMINDER_HANDLERS,
@@ -611,9 +621,13 @@ async function executeRegisteredTool(
     if (!conn) throw new Error(`no live ${owner.label} connection for integration ${ctx.integrationId ?? '(none)'}`)
     const attribution = deps.sessionToolAttributionFor
     const deliveryThread = deps.deliveryThreadNow?.(ctx) ?? ctx.deliveryThread
+    const deliveryChannel = deps.deliveryChannelNow?.(ctx) ?? ctx.channel
+    const makeRoom = deps.sessionToolRoomFor?.(ctx)
     return await owner.sessionTools.execute(name, ctx, args, {
       connection: conn,
+      deliveryChannel,
       deliveryThread,
+      ...(makeRoom ? { makeRoom } : {}),
       originMsgId: deps.searchOrigin?.(ctx),
       judgeWrite: (target) => authorizeSessionPublication(ctx, name, target, deps),
       postIdentity: () => ({
@@ -627,7 +641,7 @@ async function executeRegisteredTool(
           mentionedAgentIds: []
         }
       }),
-      recordPost: (text, ts) => deps.recordOutbound(ctx, ctx.channel, deliveryThread, text, ts, ctx.integrationId!),
+      recordPost: (text, ts) => deps.recordOutbound(ctx, deliveryChannel, deliveryThread, text, ts, ctx.integrationId!),
       ...(attribution ? { attribution: () => attribution(ctx) } : {})
     })
   }
@@ -645,6 +659,11 @@ async function executeRegisteredTool(
   if (!gw) throw new Error(`no live platform connection for integration ${ctx.integrationId ?? '(none)'}`)
 
   if (name === 'getCurrentChannel')
-    return await getCurrentChannel(ctx, gw, deps.deliveryThreadNow?.(ctx) ?? ctx.deliveryThread)
+    return await getCurrentChannel(
+      ctx,
+      gw,
+      deps.deliveryThreadNow?.(ctx) ?? ctx.deliveryThread,
+      deps.deliveryChannelNow?.(ctx) ?? ctx.channel
+    )
   throw new Error(`unknown tool: ${name}`)
 }

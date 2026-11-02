@@ -308,6 +308,7 @@ import {
 } from './daemon/steering-admission.js'
 import { recallQueryFromBlocks } from './memory/recall.js'
 import { maskableSecrets, maskSecretsDeep } from './session/secret-mask.js'
+import { readCodeTasks } from './platforms/slack/code-tasks.js'
 import { monotonicTs } from './store/monotonic-ts.js'
 import { StoreRetentionSweeper, resolveStoreRetentionSettings } from './store/retention.js'
 import { TranscriptRecorder, type TranscriptEvent } from './session/transcript-recorder.js'
@@ -410,8 +411,11 @@ import { AssistantReminders } from './assistant/reminders.js'
 import { assistantReminderToolsFor } from './mcp/ops/assistant-reminders.js'
 import { stopTaskToolsFor } from './mcp/ops/assistant-subsessions.js'
 import type { AssistantReminder } from './store/assistant-reminders.js'
-import type { AssistantSubsession } from './store/assistant-subsessions.js'
+import type { AssistantSubsession, OpenedObject } from './store/assistant-subsessions.js'
+import { createdObjectOf, feedbackPullOf } from './codehost/opened-object.js'
+import { shortTaskIds } from './assistant/task-ids.js'
 import {
+  askerClass,
   askerKey,
   askerOf,
   askerOfFollower,
@@ -430,6 +434,15 @@ import {
   type TurnAskers
 } from './assistant/place-access.js'
 import { personCouldActivate } from './assistant/place-askers.js'
+import { sharedWithOutsiders } from './assistant/standing-summary.js'
+import {
+  BOARD_HERE_LINES,
+  renderWorkBoard,
+  workBoardView,
+  type BoardPlace,
+  type BoardView,
+  type RenderedBoard
+} from './assistant/work-board.js'
 import {
   FollowUpChecks,
   CHECK_SWEEP_INTERVAL_MS,
@@ -437,6 +450,7 @@ import {
   type GettingToKnowFacts,
   type CheckParent
 } from './assistant/follow-up-checks.js'
+import { CheckedTasks, type CheckedTask } from './assistant/checked-tasks.js'
 import { FollowUpWatches, watchTarget } from './assistant/follow-up-watches.js'
 import {
   GETTING_TO_KNOW_MAX_MESSAGES,
@@ -454,7 +468,7 @@ import {
 import { gettingToKnowToolsFor } from './mcp/ops/getting-to-know.js'
 import type { ToolDescriptor } from './tool-schema/descriptor.js'
 import { AssistantTasks, callerOfMessage, type TaskCaller } from './assistant/tasks.js'
-import type { AssistantItem, AssistantPlace } from './store/assistant-items.js'
+import type { AssistantPlace } from './store/assistant-items.js'
 import type {
   AssistantDraft,
   AssistantDraftDestination,
@@ -489,7 +503,7 @@ import {
   type DreamOperationPolicy,
   type DreamPlaces
 } from './dream/runner.js'
-import { describePlace, judgeSessionParticipation, memberMakesNew, type PlaceAccessDeps } from './mcp/ops/place-gate.js'
+import { describePlace, judgeSessionParticipation, kindFromRows, type PlaceAccessDeps } from './mcp/ops/place-gate.js'
 import { PLACE_SHARE_TTL_MS, PlaceTrust } from './assistant/place-trust.js'
 import { buildCpClientDeps, type CpClientDepsHost } from './cp/cp-client-deps.js'
 import {
@@ -550,7 +564,6 @@ import type {
   PlatformChannelInfo,
   PlatformConnection as ContractConnection,
   RelayCardClicks,
-  TaskPlace,
   Welcome
 } from './platforms/contract.js'
 import { compoundMentionAddressesFor } from './platforms/mention-address.js'
@@ -988,7 +1001,13 @@ import {
   subsessionLabel,
   type SubsessionApprovalRoute
 } from './permissions/subsession-approval.js'
-import { CollabCoordinator, TASK_NOT_FOUND, TASK_NOT_FOUND_MESSAGE, type CollabHost } from './collab/coordinator.js'
+import {
+  CollabCoordinator,
+  roomRunReport,
+  TASK_NOT_FOUND,
+  TASK_NOT_FOUND_MESSAGE,
+  type CollabHost
+} from './collab/coordinator.js'
 import { legacySessionMessageId } from './collab/session-message.js'
 import { CpAgentRegistry } from './cp/cp-agent-registry.js'
 import {
@@ -1029,6 +1048,7 @@ import {
   stableMessageId,
   stableTurnId,
   type NormalizedMessage,
+  sessionChannelOf,
   sessionThreadOf,
   wakeThreadFields
 } from './messages/normalized.js'
@@ -1051,9 +1071,11 @@ import {
 } from './auto-session/coordinator-sessions.js'
 import {
   answerThreadOf,
+  batchCut,
   coordinatorView,
   inThread,
-  platformMessageIdOf,
+  reportAboutOf,
+  reportJoinsBatch,
   threadless,
   wholeRoomThread,
   type DeliveredMessage
@@ -1343,6 +1365,7 @@ import {
   MAX_QUEUED_PER_SESSION,
   MAX_SESSION_PURGE_BATCH,
   MAX_SETTLED_TASKS_PER_SESSION,
+  MAX_STEERS_PER_TURN,
   MAX_TURN_CONTEXT_REGENERATION_MS,
   MAX_TURN_CONTEXT_REGENERATIONS,
   PROBE_ROOT_SWEEP_INTERVAL_MS,
@@ -1802,16 +1825,29 @@ export class Daemon {
         onStart: (p, created) =>
           startSlackCodeDiff(p, turnState<SlackTurnState>(p), {
             open: () => this.turnTaskDiff(p, created),
+            // A coordinator's task saves its starting point on its first turn, where it opened, for a code channel it makes later.
+            keepStart: async () => {
+              if (
+                !created ||
+                !(await this.store.assistantSubsessions.get(p.plan.agentId, p.plan.sessionKey))?.openedFor
+              )
+                return
+              await this.turnTaskDiff(p, created)
+            },
             authorize: async () => {
               try {
-                await this.mcp.authorizeConversationOutput({
-                  agentId: p.plan.agentId,
-                  integrationId: p.plan.integrationId,
-                  platform: p.plan.platform,
-                  channel: p.plan.channel,
-                  thread: p.plan.sessionThread,
-                  transportScope: p.entry.msg.transportScope
-                })
+                // The session is found where it lives; the output goes to the channel this turn runs in.
+                await this.mcp.authorizeConversationOutput(
+                  {
+                    agentId: p.plan.agentId,
+                    integrationId: p.plan.integrationId,
+                    platform: p.plan.platform,
+                    channel: sessionChannelOf(p.entry.msg),
+                    thread: p.plan.sessionThread,
+                    transportScope: p.entry.msg.transportScope
+                  },
+                  p.plan.channel
+                )
               } catch {
                 throw new TaskDiffUnavailable(
                   'Publication is not authorized for this task. Automatic updates have stopped.'
@@ -1991,7 +2027,7 @@ export class Daemon {
     now: () => this.clock.now(),
     dispatch: (agentId, msg, integrationId) => {
       // Its own inbox row beside the coordinator's, which the coordinator's turn still holds.
-      const taskKey = sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), agentId, msg.transportScope)
+      const taskKey = sessionKey(msg.platform, sessionChannelOf(msg), sessionThreadOf(msg), agentId, msg.transportScope)
       const deliveryId = `${stableMessageId(msg)}\u001f${taskKey}`
       void this.dispatch(agentId, msg, integrationId, undefined, undefined, { deliveryId }).catch((err) =>
         this.log.warn(`coordinator: handing ${msg.msgId} to its task failed: ${formatErr(err)}`)
@@ -2001,8 +2037,6 @@ export class Daemon {
     showTriaging: (agentId, message) => this.showTriaging(agentId, message),
     sessionLink: (sessionId) => this.sessionLink(sessionId),
     reportTaskOwners: async (agentId, keys) => await this.reportTaskOwners(agentId, keys),
-    openTaskPlace: async (agentId, integrationId, msg, title) =>
-      await this.openTaskPlace(agentId, integrationId, msg, title),
     threadLink: (integrationId, at) =>
       sessionThreadUrlFor(at, integrationId === undefined ? undefined : this.connForIntegration(integrationId)),
     warn: (message) => this.log.warn(message)
@@ -2934,6 +2968,7 @@ export class Daemon {
         await this.sessions.threadOwner(channel, thread, transportScope),
       sessionCoordinateFor: async (agentId, integrationId, msg, opts) =>
         await this.sessionCoordinateFor(agentId, integrationId, msg, opts),
+      heldRoomSession: async (agentId, msg) => await this.heldRoomSession(agentId, msg),
       conversationAppends: (agentId, integrationId, msg) => this.conversationAppends(agentId, integrationId, msg),
       rootCoordinateKind: (agentId, integrationId, at) => this.rootCoordinateKind(agentId, integrationId, at),
       adoptCoordinatorTasks: async (agentId, fromKey, toKey) =>
@@ -3048,6 +3083,20 @@ export class Daemon {
         this.dispatch(agentId, msg, integrationId, undefined, callMeta),
       handleStatusAction: (a) => this.commands.handleStatusAction(a),
       statusInfoForKey: (key) => this.statusInfoForKey(key),
+      slackCodeTasks: (channel, key, srcIntegrationIds) =>
+        readCodeTasks(
+          {
+            store: this.store,
+            admitted: () => this.commands.slackThreadSessions({ channel, thread: channel }, srcIntegrationIds),
+            open: (session) => this.sessionChatSurfaceOpen(session),
+            assistant: (agentId) => assistantModeOn(this.agents.get(agentId)),
+            runtime: (req) => this.listBackgroundTasks(req),
+            link: (sessionId) => this.sessionLink(sessionId, 'slack'),
+            mask: (agentId, value) => this.maskAgentSecrets(agentId, value)
+          },
+          channel,
+          key
+        ),
       handlePermissionChoice: (a) =>
         void this.routePermissionChoice(a).catch((err) => this.log.warn(`permission choice failed: ${formatErr(err)}`)),
       handleElicitChoice: async (a) => {
@@ -4894,6 +4943,19 @@ export class Daemon {
       deliveryThreadNow: (ctx) =>
         this.activeTurnShare.get(sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope))
           ?.thread,
+      // The live turn's channel, which differs from the session's in a room a task holds (auto-session-mode.md §6.8).
+      deliveryChannelNow: (ctx) =>
+        this.activeTurnShare.get(sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope))
+          ?.channel,
+      // A room the session makes for its work: a coordinator's task holds it as one more thread (auto-session-mode.md §6.8).
+      sessionToolRoomFor: (ctx) => (make) =>
+        this.coordinators.makeRoom(ctx.agentId, this.sessionKeyOf(ctx), async () => {
+          const { result, room } = await make()
+          return {
+            result,
+            ...(room ? { room: { ...room, platform: ctx.platform, transportScope: ctx.transportScope ?? null } } : {})
+          }
+        }),
       // A platform's own session tools act through ANY platform's connection — including the one
       // the reply-surface registry above omits (Linear, §4.6).
       sessionToolConnectionFor: (integrationId) => this.anyConnForIntegration(integrationId),
@@ -5092,7 +5154,7 @@ export class Daemon {
       memory: this.memory,
       memoryEntryStore: this.store,
       assistantItems: {
-        ledgerFor: (agentId) => (assistantModeOn(this.agents.get(agentId)) ? this.store.assistantItems : undefined),
+        ledgerFor: (agentId) => (assistantModeOn(this.agents.get(agentId)) ? this.checkedTasks : undefined),
         askerFor: (ctx) => this.assistantAskerFor(ctx),
         // A getting-to-know task of the session's place, as its long session asked (§5.13).
         gettingToKnow: (ctx) => this.requestGettingToKnow(ctx),
@@ -5103,9 +5165,9 @@ export class Daemon {
           this.followUpWatches.offered()
             ? {
                 check: (url) => void watchTarget(url),
-                set: (agentId, itemId, url) => this.followUpWatches.set(agentId, itemId, url),
-                clear: (agentId, itemId) => this.followUpWatches.clear(agentId, itemId),
-                end: (agentId, itemId) => this.followUpWatches.end(agentId, itemId)
+                set: (agentId, taskKey, url) => this.followUpWatches.set(agentId, taskKey, url),
+                clear: (agentId, taskKey) => this.followUpWatches.clear(agentId, taskKey),
+                end: (agentId, taskKey) => this.followUpWatches.end(agentId, taskKey)
               }
             : undefined,
         // A follow-up of the session's place, owned by its long session, else by the session taking it (§5.12).
@@ -5113,7 +5175,13 @@ export class Daemon {
           const key = this.sessionKeyOf(ctx)
           const sessionId = await this.store.ensureOutwardSessionId(key, ctx.agentId, this.clock.now())
           // The thread the taking turn replies in, where the follow-up's reports reply too; a coordinator's, the asking message's.
-          const replyThread = ctx.forMessage ? answerThreadOf(ctx.forMessage) : this.activeTurnShare.get(key)?.thread
+          const live = this.activeTurnShare.get(key)
+          // A turn in a channel a task holds takes it for the task's own place, in the task's thread there (auto-session-mode.md §6.8).
+          const replyThread = ctx.forMessage
+            ? answerThreadOf(ctx.forMessage)
+            : live && live.channel !== ctx.channel
+              ? ctx.thread
+              : live?.thread
           return await this.followUpChecks.take({
             agentId: ctx.agentId,
             origin: placeOfSession(ctx),
@@ -5123,16 +5191,16 @@ export class Daemon {
           })
         },
         check: {
-          itemFor: (ctx) =>
-            this.followUpChecks.itemFor(
+          taskFor: (ctx) =>
+            this.followUpChecks.taskFor(
               ctx.agentId,
               sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope)
             ),
-          report: (ctx, itemId, text) =>
+          report: (ctx, taskKey, text) =>
             this.followUpChecks.report(
               ctx.agentId,
               sessionKey(ctx.platform, ctx.channel, ctx.thread, ctx.agentId, ctx.transportScope),
-              itemId,
+              taskKey,
               text
             ),
           propose: (ctx, input) =>
@@ -5157,11 +5225,15 @@ export class Daemon {
       assistantSubsessions: {
         actor: (ctx) => this.taskStopper(ctx),
         sessionIdOf: async (key) => (await this.store.getSession(key))?.sessionId ?? undefined,
-        find: async (agentId, id) =>
-          (await this.store.assistantSubsessions.get(agentId, id)) ??
-          (await this.store
-            .getSessionByOutwardIdOnly(id, agentId)
-            .then((child) => (child ? this.store.assistantSubsessions.get(agentId, child.key) : undefined))),
+        find: async (agentId, id) => {
+          const key = await this.store.assistantSubsessions.resolve(agentId, id)
+          return (
+            (key !== undefined ? await this.store.assistantSubsessions.get(agentId, key) : undefined) ??
+            (await this.store
+              .getSessionByOutwardIdOnly(id, agentId)
+              .then((child) => (child ? this.store.assistantSubsessions.get(agentId, child.key) : undefined)))
+          )
+        },
         stopSession: (key, actor) => this.stopSessionByKey(key, actor),
         listForOwner: (agentId, parent, limit, opts) =>
           this.store.assistantSubsessions.listForOwner(agentId, parent, limit, opts),
@@ -5176,16 +5248,25 @@ export class Daemon {
         followUps: {
           own: async (ctx) =>
             (await this.followUpOwner(ctx.agentId, this.sessionKeyOf(ctx), placeOfSession(ctx))) !== undefined,
-          get: (agentId, key) => this.store.assistantItems.byTaskKey(agentId, key),
+          get: (agentId, key) => this.checkedTasks.get(agentId, key),
           stop: (ctx, item) => this.followUpChecks.stop(ctx.agentId, item, this.taskStopper(ctx)),
           reported: async (item) =>
-            (await this.store.assistantChecks.checks(item.agentId, item.id, 1))[0]?.reported ?? false
+            (await this.store.assistantChecks.checks(item.agentId, item.taskKey, 1))[0]?.reported ?? false
         },
         sessionOf: async (key) => {
           const rec = await this.store.getSession(key)
           return rec ? { title: rec.title ?? null, updatedAt: rec.updatedAt } : undefined
         },
         ownerOf: (row) => this.taskOwnerName(row),
+        shortIds: (agentId) => this.shortTaskIdsOf(agentId),
+        opened: (agentId, key) => this.store.assistantSubsessions.opened(agentId, key),
+        board: async (ctx, owner) =>
+          await this.workBoardOf(
+            ctx.agentId,
+            owner,
+            { ...placeOfSession(ctx), ...(ctx.integrationId ? { integrationId: ctx.integrationId } : {}) },
+            await this.readAskersFor(ctx)
+          ),
         threadsOf: async (agentId, key) =>
           (await this.store.assistantSubsessions.threadsOf(agentId, key)).map((t) => {
             const integrationId = this.integrationIdForSessionTransport(agentId, t.platform, t.transportScope)
@@ -5200,6 +5281,18 @@ export class Daemon {
           return saved
         },
         now: () => this.clock.now()
+      },
+      // A task's record and words for readTask and recall's inlined ids (assistant-mode.md §5.18 ④), closed tasks within their window included.
+      taskReads: {
+        resolve: (agentId, id) => this.store.assistantSubsessions.resolve(agentId, id),
+        record: (agentId, key) => this.store.assistantSubsessions.record(agentId, key),
+        checked: (agentId, key) => this.checkedTasks.get(agentId, key),
+        opened: (agentId, key) => this.store.assistantSubsessions.opened(agentId, key),
+        watchUrls: (agentId) => this.store.assistantSubsessions.watchUrls(agentId),
+        session: (key) => this.store.getSession(key),
+        shortIds: (agentId) => this.shortTaskIdsOf(agentId),
+        openedFor: (agentId, message) => this.store.assistantSubsessions.taskOpenedFor(agentId, message),
+        holding: (agentId, at) => this.store.assistantSubsessions.taskOfThread(agentId, at)
       },
       // Resolved from trusted session coordinates at call time, so a place that changes audience applies at once.
       memoryScope: (ctx, call) => this.memoryToolScope(ctx, call),
@@ -5497,6 +5590,13 @@ export class Daemon {
       slackBotUserIdFor: (integrationId) => this.connByIntegration.get(integrationId)?.botUserId || undefined,
       taskPagesTakeMessages: () => this.cfg.features.autoSessionMode,
       tasksCoordinatorOnly: () => this.cfg.features.autoSessionMode,
+      workBoardFor: (input) =>
+        this.renderedWorkBoard(
+          input.agentId,
+          { ...(input.sessionId ? { sessionId: input.sessionId } : {}), key: input.sessionKey },
+          input.place,
+          this.askersOfKey(input.sessionKey, input.place.integrationId)
+        ),
       senderTimeZoneFor: (msg, integrationId) => this.profileTimeZone(integrationId, msg.sender.id),
       startedByTimeZone: (agentId, key) => this.startedByTimeZone(agentId, key),
       notePersonTimeZone: (key, zone) => this.notePersonTimeZone(key, zone),
@@ -7605,7 +7705,7 @@ export class Daemon {
     pod: SandboxSubject,
     plane:
       | (Pick<K8sRuntimePlane, 'skillClientFor' | 'workspaceIncarnationFor' | 'shimGenerationFor'> &
-          Partial<Pick<K8sRuntimePlane, 'servesTunnel'>>)
+          Partial<Pick<K8sRuntimePlane, 'servesTunnel' | 'deviceWorkspaceIncarnationFor'>>)
       | undefined = this.k8sPlane,
     cwd?: string
   ): Promise<ClusterSkillLedger | undefined> {
@@ -7613,10 +7713,21 @@ export class Daemon {
     const shimGeneration = plane?.shimGenerationFor?.(pod)
     const isLaunchCurrent = () =>
       plane?.workspaceIncarnationFor?.(pod) === reported && plane?.shimGenerationFor?.(pod) === shimGeneration
+    // Receipts are relative to the directory installed into, so installs into a cwd keep a ledger of their own.
+    const keyFor = (incarnation: string | undefined) =>
+      incarnation && cwd ? cwdWorkspaceIncarnation(incarnation, cwd) : incarnation
+    const workspaceIncarnation = keyFor(reported)
+    const deviceIncarnation = keyFor(plane?.deviceWorkspaceIncarnationFor?.(pod))
+    const initialLedger =
+      workspaceIncarnation &&
+      deviceIncarnation &&
+      !(await this.store.clusterSkillLedger(agent.id, workspaceIncarnation))
+        ? (await this.store.clusterSkillLedger(agent.id, deviceIncarnation))?.ledger
+        : undefined
     const ledger = await this.reconcileSandboxSkills(agent, {
       client: plane?.skillClientFor?.(pod, cwd),
-      // Receipts are relative to the directory installed into, so installs into a cwd keep a ledger of their own.
-      workspaceIncarnation: reported && cwd ? cwdWorkspaceIncarnation(reported, cwd) : reported,
+      workspaceIncarnation,
+      ...(initialLedger ? { initialLedger } : {}),
       shimGeneration,
       isLaunchCurrent,
       // Only the pool's plane serves tunnels per pod; an executor's client is never granted `skills-git`.
@@ -7692,10 +7803,11 @@ export class Daemon {
         }
         localAuthority = await pending
       }
-      const { client, workspaceIncarnation } = await microsandboxSkillTarget(session, cwd)
+      const { client, workspaceIncarnation, deviceIncarnation } = await microsandboxSkillTarget(session, cwd)
       const initialLedger = (await this.store.clusterSkillLedger(agent.id, workspaceIncarnation))
         ? undefined
-        : await legacySandboxSkillLedger(agent.id, cwd, join(this.root, 'skill-installs'))
+        : ((await this.store.clusterSkillLedger(agent.id, deviceIncarnation))?.ledger ??
+          (await legacySandboxSkillLedger(agent.id, cwd, join(this.root, 'skill-installs'))))
       const ledger = await this.reconcileSandboxSkills(agent, {
         client,
         workspaceIncarnation,
@@ -9595,9 +9707,9 @@ export class Daemon {
         const int = this.integrationConfigById(integrationId)
         return int ? memberAskerIdentity(int.platform, await this.tenantScopeForIntegration(int), userId) : undefined
       },
-      followUpTaken: async (agentId, itemId) => (await this.store.assistantItems.get(agentId, itemId)) !== undefined,
-      observe: async (agentId, itemId, text) => {
-        await this.store.assistantItems.appendObservation(agentId, itemId, {
+      followUpTaken: async (agentId, taskKey) => (await this.checkedTasks.get(agentId, taskKey)) !== undefined,
+      observe: async (agentId, taskKey, text) => {
+        await this.checkedTasks.appendObservation(agentId, taskKey, {
           text,
           author: 'proposal',
           now: this.clock.now()
@@ -9722,7 +9834,7 @@ export class Daemon {
       log: { info: (m) => this.log.info(m), warn: (m) => this.log.warn(m) },
       ledger: () => this.store.assistantDrafts,
       subsessions: this.store.assistantSubsessions,
-      items: this.store.assistantItems,
+      items: this.checkedTasks,
       agent: (agentId) => {
         const a = this.agents.get(agentId)
         return a
@@ -9738,8 +9850,8 @@ export class Daemon {
         this.reportIntoParent(agentId, caller, parentSessionId, text, reportId),
       settled: (draft) => this.drafts.taskSettled(draft),
       takeFollowUp: (input) => this.followUpChecks.take(input),
-      watchFollowUp: async (agentId, itemId, url) => {
-        const outcome = await this.followUpWatches.set(agentId, itemId, url)
+      watchFollowUp: async (agentId, taskKey, url) => {
+        const outcome = await this.followUpWatches.set(agentId, taskKey, url)
         return outcome.kind === 'refused' ? outcome.reason : undefined
       },
       draining: () => this.draining
@@ -10045,7 +10157,7 @@ export class Daemon {
 
   /** A check's proposal (assistant-mode.md §5.10): run in its follow-up's place once approved, carded there or decided on a webchat conversation's page. */
   private async proposeFromCheck(
-    run: { agentId: string; key: string; item: AssistantItem },
+    run: { agentId: string; key: string; item: CheckedTask },
     input: ProposeInput
   ): Promise<Record<string, unknown>> {
     const { agentId, key, item } = run
@@ -10069,7 +10181,8 @@ export class Daemon {
       ...proposalWork(input),
       sentence: input.sentence,
       why: input.why,
-      itemId: item.id,
+      // A proposal names the task it acts on by its one id, the task key (assistant-mode.md §5.18).
+      itemId: item.taskKey,
       itemVersion: item.version,
       source,
       ...(place ? { place } : {}),
@@ -10133,7 +10246,7 @@ export class Daemon {
           ...proposalWork(input),
           sentence: input.sentence,
           why: input.why,
-          itemId: item.id,
+          itemId: item.taskKey,
           itemVersion: item.version,
           source: {
             platform: ctx.platform,
@@ -10227,11 +10340,21 @@ export class Daemon {
     return (await this.collab.deliverDaemonReport(report)).admitted
   }
 
+  /** Every checked task by its one id (assistant-mode.md §5.18): watch tasks, and the getting-to-know tasks the item ledger keeps. */
+  private checkedTaskService?: CheckedTasks
+  private get checkedTasks(): CheckedTasks {
+    this.checkedTaskService ??= new CheckedTasks({
+      watchTasks: this.store.assistantWatchTasks,
+      items: this.store.assistantItems
+    })
+    return this.checkedTaskService
+  }
+
   /** What follow-ups watch (assistant-mode.md §5.14), built on first use: only toward a Control Plane that takes watches. */
   private followUpWatchService?: FollowUpWatches
   private get followUpWatches(): FollowUpWatches {
     this.followUpWatchService ??= new FollowUpWatches({
-      items: this.store.assistantItems,
+      watchTasks: this.store.assistantWatchTasks,
       port: {
         request: async (agentId, req) => {
           const cp = this.cpClient
@@ -10264,6 +10387,8 @@ export class Daemon {
       holdsDuty: (agentId) => this.servesAgent(agentId) && !this.drainingAgents.has(agentId),
       watches: this.followUpWatches,
       draining: () => this.draining,
+      tasks: this.checkedTasks,
+      watchTasks: this.store.assistantWatchTasks,
       items: this.store.assistantItems,
       checks: this.store.assistantChecks,
       subsessions: this.store.assistantSubsessions,
@@ -10307,7 +10432,7 @@ export class Daemon {
     if (rec?.key !== callerKey) return undefined
     const sessionId = await this.store.ensureOutwardSessionId(rec.key, agentId, this.clock.now())
     const owner = { sessionId, key: rec.key }
-    await this.store.assistantSubsessions.adoptFollowUps(agentId, place, owner)
+    await this.store.assistantSubsessions.adoptWatchTasks(agentId, place, owner)
     return owner
   }
 
@@ -10323,7 +10448,7 @@ export class Daemon {
       channel: req.callerChannel,
       transportScope: req.callerTransportScope ?? null
     }
-    const item = await this.store.assistantItems.byTaskKey(agentId, taskKey)
+    const item = await this.checkedTasks.get(agentId, taskKey)
     const ofPlace =
       item !== undefined &&
       item.origin.platform === place.platform &&
@@ -10362,7 +10487,7 @@ export class Daemon {
     const row = decides
       ? await this.store.assistantSubsessions.get(ctx.agentId, this.sessionKeyOf(ctx)).catch(() => undefined)
       : undefined
-    const threadedTask = row !== undefined && row.kind !== 'follow-up'
+    const threadedTask = row !== undefined && row.mode !== 'watch'
     return taskReachAt(ctx.thread, { coordinatorOnly, assistantMode, threadedTask })
   }
 
@@ -10474,6 +10599,8 @@ export class Daemon {
     // Under `auto` the place's long session is its coordinator (auto-session-mode.md §3.4).
     const coordinator = mode === 'auto' && this.cfg.features.autoSessionMode
     if (!int || (mode !== 'append' && !coordinator)) return undefined
+    // A channel a task holds has no long session of its own (auto-session-mode.md §6.8).
+    if (await this.heldByTask(agentId, int, place.channel)) return undefined
     const thread = coordinator
       ? await this.resolveCoordinator(agentId, {
           platform: place.platform,
@@ -10496,13 +10623,16 @@ export class Daemon {
   }
 
   /** What a getting-to-know task of this place names (assistant-mode.md §5.13), or why it may no longer take one; a place turned external is named so its handling keeps step 1 alone. */
-  private async gettingToKnowFacts(agentId: string, item: AssistantItem): Promise<GettingToKnowFacts> {
+  private async gettingToKnowFacts(agentId: string, item: CheckedTask): Promise<GettingToKnowFacts> {
     const agent = this.agents.get(agentId)
     const { platform, channel, transportScope } = item.origin
     const integrationId = this.integrationIdForTransportScope(agentId, platform, transportScope)
     const int = agent?.integrations.find((candidate) => candidate.id === integrationId)
     if (!agent || !int || !integrationId) return { refused: 'the agent no longer reaches this place' }
-    const refusal = gettingToKnowPlaceRefusal(agent, int, { channel })
+    const refusal = gettingToKnowPlaceRefusal(agent, int, {
+      channel,
+      heldByTask: await this.heldByTask(agentId, int, channel)
+    })
     if (refusal && refusal !== 'external') return { refused: GETTING_TO_KNOW_REFUSAL_REASONS[refusal] }
     const info = await this.placeInfo(integrationId, channel)
     const name = info?.name?.trim()
@@ -10642,7 +10772,7 @@ export class Daemon {
   /** Bot joins waiting for their place's row before a getting-to-know task (assistant-mode.md §5.13). */
   private readonly pendingGettingToKnowTasks = new PendingGettingToKnowTasks()
 
-  /** A genuine join of the agent's bot to a conversation (§5.13): where a getting-to-know task will run, it waits for the place's row and takes one; true then. */
+  /** A genuine join of the agent's bot to a conversation (§5.13): where a getting-to-know task will run, it waits for the place's row and takes one; true then, and for a channel a task holds, which takes nothing. */
   private async gettingToKnowOnJoin(
     agentId: string,
     integrationId: string,
@@ -10652,6 +10782,8 @@ export class Daemon {
     const agent = this.agents.get(agentId)
     const int = agent?.integrations.find((candidate) => candidate.id === integrationId)
     if (!agent || !int || !this.servesAgent(agentId)) return false
+    // A channel a task holds is its workspace, never a place of its own: the join takes nothing (auto-session-mode.md §6.8).
+    if (await this.heldByTask(agentId, int, channel)) return true
     if (gettingToKnowPlaceRefusal(agent, int, { channel }) !== undefined) return false
     const place: AssistantPlace = {
       platform: int.platform,
@@ -10687,6 +10819,7 @@ export class Daemon {
       }
       // The getting-to-know task's row is the place's record, so a rejoin or a mode switch takes none.
       if (await this.store.assistantItems.latestGettingToKnow(join.agentId, place)) continue
+      if (await this.heldByTask(join.agentId, int, join.channel)) continue
       const asker = join.inviter
         ? memberAskerIdentity(int.platform, await this.tenantScopeForIntegration(int), join.inviter)
         : undefined
@@ -10698,6 +10831,22 @@ export class Daemon {
         ...(asker !== undefined ? { asker } : {})
       })
     }
+  }
+
+  /** Whether one of the agent's tasks holds this room keyed as one thread, under its integration's scope or its socket's; it waits for a room still being attached. */
+  private async heldByTask(agentId: string, int: Integration, channel: string): Promise<boolean> {
+    if (!this.cfg.features.autoSessionMode) return false
+    await this.coordinators.roomsAttached(agentId)
+    const conn = this.anyConnForIntegration(int.id)
+    const scopes = new Set([
+      this.transportScopeForIntegration(int) || null,
+      ...(conn ? [this.transportScopeForIntegrationIds(this.srcIntegrationIds(conn)) ?? null] : [])
+    ])
+    for (const transportScope of scopes) {
+      const at = { platform: int.platform, channel, transportScope, thread: channel }
+      if ((await this.store.assistantSubsessions.taskOfThread(agentId, at)) !== undefined) return true
+    }
+    return false
   }
 
   /** A getting-to-know task's title, by its place's name where the platform gives one. */
@@ -10750,7 +10899,7 @@ export class Daemon {
     if (!state || state.runningCheck === null) return 0
     return await this.store.assistantChecks.takeHistory(
       ctx.agentId,
-      state.itemId,
+      state.taskKey,
       state.runningCheck,
       want,
       GETTING_TO_KNOW_MAX_MESSAGES
@@ -11577,15 +11726,15 @@ export class Daemon {
     }
     if (isTaskCoordinate(thread)) {
       const task = await this.store.assistantDrafts.taskBySubsession(agentId, key).catch(() => undefined)
-      const itemId = task?.proposal?.itemId
-      const item = itemId ? await this.store.assistantItems.get(agentId, itemId).catch(() => undefined) : undefined
+      const taskKey = task?.proposal?.itemId
+      const item = taskKey ? await this.checkedTasks.get(agentId, taskKey).catch(() => undefined) : undefined
       return await this.itemAskers(agentId, item)
     }
     return isSubsessionCoordinate(thread) ? (this.subsessionOpeners.get(key) ?? NOBODY) : undefined
   }
 
   /** The person who confirmed a follow-up, on the bot its place is reached through. */
-  private async itemAskers(agentId: string, item: AssistantItem | undefined): Promise<TurnAskers> {
+  private async itemAskers(agentId: string, item: CheckedTask | undefined): Promise<TurnAskers> {
     if (!item?.asker) return NOBODY
     const bot = this.integrationIdForTransportScope(agentId, item.origin.platform, item.origin.transportScope)
     const asker = askerOfFollower(item.asker, item.origin.platform, bot)
@@ -11595,19 +11744,27 @@ export class Daemon {
   private askersOfKey(key: string, bot: string | undefined, opener?: TurnAskers): TurnAskers {
     const live = this.activeGateEntries.get(key)
     if (!live) return NOBODY
-    return turnAskers([this.turnMessageOf(live), ...(live.foldedMessages ?? [])], bot ?? live.integrationId, opener)
+    const turn = [this.turnMessageOf(live), ...(live.foldedMessages ?? [])]
+    // A report in a coordinator batch brings no asker, and a batch of reports alone is no one (assistant-mode.md §5.18 ③).
+    const asking =
+      live.coordinatorBatch !== undefined && !opener?.people.length ? turn.filter((m) => m.msg.source === 'user') : turn
+    return asking.length > 0 ? turnAskers(asking, bot ?? live.integrationId, opener) : NOBODY
   }
 
-  /** The read rule's view of a queued message: its bot, whether the console sent it, and a schedule's recorded person. */
+  /** The read rule's view of a queued message: its bot, whether the console sent it, and a schedule's or a coordinator message's person. */
   private turnMessageOf(entry: QueueEntry): TurnMessage {
     const cronId = entry.msg.source === 'cron' ? entry.msg.cronRun?.cronId : undefined
     const userId = cronId ? this.cpCrons?.askerOf(cronId) : undefined
-    return {
+    const view: TurnMessage = {
       msg: entry.msg,
       ...(entry.integrationId ? { integrationId: entry.integrationId } : {}),
       ...(entry.webchat && entry.webchat.initiator !== 'agent' ? { console: true } : {}),
       ...(userId ? { person: { kind: 'console' as const, userId } } : {})
     }
+    if (!isCoordinatorCoordinate(sessionThreadOf(entry.msg))) return view
+    // A coordinator's messages are headless only so it speaks through its outcomes (auto-session-mode.md §4.2); each still asks as its sender.
+    const sender = askerOf({ ...view, msg: { ...entry.msg, headless: false } }, undefined)
+    return sender ? { ...view, person: sender } : view
   }
 
   /** A message folded into the live turn joins the people it reads for; recorded before the model can see it. */
@@ -11717,8 +11874,8 @@ export class Daemon {
   /** Who a task works for (auto-session-mode.md §6.2): a follow-up's asker, else the opener of the first session above it that is no task. */
   private async taskOwnerName(row: AssistantSubsession): Promise<string | undefined> {
     let id: string | undefined
-    if (row.kind === 'follow-up') {
-      const asker = (await this.store.assistantItems.byTaskKey(row.agentId, row.childSessionKey))?.asker
+    if (row.mode === 'watch') {
+      const asker = (await this.checkedTasks.get(row.agentId, row.childSessionKey))?.asker
       // A platform asker is `<platform>:<scope>:<uid>`; a console asker's `user:<id>` names no one people know.
       id = asker && !asker.startsWith('user:') ? asker.slice(asker.lastIndexOf(':') + 1) : undefined
     } else {
@@ -11735,6 +11892,57 @@ export class Daemon {
     }
     if (!id) return undefined
     return (await this.store.getDisplayNames([id])).get(id) ?? id
+  }
+
+  /** A coordinator's work board as `askers` may see it (assistant-mode.md §5.18): other places' lines only in assistant mode, and never into a place shared with another organization. */
+  private async workBoardOf(
+    agentId: string,
+    owner: { sessionId?: string; key: string },
+    place: BoardPlace & { integrationId?: string },
+    askers: TurnAskers
+  ): Promise<BoardView> {
+    const agent = this.agents.get(agentId)
+    const elsewhere = agent?.assistantMode?.enabled === true && !sharedWithOutsiders(agent, place)
+    const placeDeps: Pick<PlaceAccessDeps, 'gatewayFor' | 'placeSnapshot'> = {
+      gatewayFor: (integrationId) => this.gatewayForIntegration(integrationId),
+      placeSnapshot: (integrationId, channel) => this.readPlaceSnapshot(integrationId, channel)
+    }
+    return await workBoardView({
+      stores: this.store,
+      agentId,
+      owner,
+      place,
+      ...(elsewhere
+        ? {
+            judge: {
+              askers,
+              lookups: this.placeMembers.lookupsFor(agentId),
+              current: {
+                platform: place.platform,
+                ...(place.integrationId ? { integrationId: place.integrationId } : {})
+              },
+              botOf: (at) => this.integrationIdForTransportScope(agentId, at.platform, at.transportScope),
+              describe: (at, kind, bot) => describePlace(at, kindFromRows(at.platform, [kind]), bot, placeDeps)
+            }
+          }
+        : {})
+    })
+  }
+
+  /** The board a coordinator turn carries, its Here lines naming who asked for each. */
+  private async renderedWorkBoard(
+    agentId: string,
+    owner: { sessionId?: string; key: string },
+    place: BoardPlace & { integrationId?: string },
+    askers: TurnAskers
+  ): Promise<RenderedBoard> {
+    const view = await this.workBoardOf(agentId, owner, place, askers)
+    const names = new Map<string, string>()
+    for (const task of view.here.slice(0, BOARD_HERE_LINES)) {
+      const name = task.row ? await this.taskOwnerName(task.row).catch(() => undefined) : undefined
+      if (name) names.set(task.id, name)
+    }
+    return renderWorkBoard(view, names)
   }
 
   /** A sub-session reads as the people whose turn opened it; a restart forgets them, so it then reads as nobody. */
@@ -13463,9 +13671,8 @@ export class Daemon {
     // this post. Keying on the observer would let the author's connection read an
     // unrelated scope's mute, dispatch the target anyway, and leave the real tombstone
     // standing — after which the target's own copy deduplicates before it can clear it.
-    const targetCoordinate = await this.sessionCoordinateFor(targetAgentId, integrationId, msg)
-    if (targetCoordinate !== undefined) msg.sessionThread = targetCoordinate
-    const muteKey = sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), targetAgentId, targetScope)
+    await this.keySession(targetAgentId, integrationId, msg)
+    const muteKey = sessionKey(msg.platform, sessionChannelOf(msg), sessionThreadOf(msg), targetAgentId, targetScope)
     // A conversation that appends is never muted: `!stop` there interrupts the turn and
     // sets no latch (§6.3), and a latch left over from before the flip must not silence the
     // one session the whole room now shares.
@@ -13602,6 +13809,33 @@ export class Daemon {
     })
   }
 
+  /** Key a message on its session for one agent: a room a task holds keys on the task's (auto-session-mode.md §6.8), any other on the coordinate its conversation's mode gives. */
+  private async keySession(agentId: string, integrationId: string | undefined, msg: NormalizedMessage): Promise<void> {
+    const held = await this.heldRoomSession(agentId, msg)
+    if (held) {
+      if (held.channel !== msg.channel) msg.sessionChannel = held.channel
+      if (held.thread !== msg.thread) msg.sessionThread = held.thread
+      return
+    }
+    const coordinate = await this.sessionCoordinateFor(agentId, integrationId, msg)
+    if (coordinate !== undefined) msg.sessionThread = coordinate
+  }
+
+  /** The session of the task holding a room keyed as one thread, whatever the room's own mode; it waits for a room still being attached (auto-session-mode.md §6.8). */
+  private async heldRoomSession(
+    agentId: string,
+    msg: Pick<NormalizedMessage, 'platform' | 'channel' | 'thread' | 'transportScope' | 'isDm' | 'isGroupDm'>
+  ): Promise<{ channel: string; thread: string } | undefined> {
+    if (!wholeRoomThread(msg) || !this.cfg.features.autoSessionMode) return undefined
+    await this.coordinators.roomsAttached(agentId)
+    const index = this.store.assistantSubsessions
+    const at = { platform: msg.platform, channel: msg.channel, transportScope: msg.transportScope ?? null }
+    const task = await index.taskOfThread(agentId, { ...at, thread: msg.channel })
+    if (task === undefined) return undefined
+    const session = await this.store.getSession(task)
+    return session ? { channel: session.channel, thread: session.thread } : (await index.threadsOf(agentId, task))[0]
+  }
+
   private async sessionCoordinateFor(
     agentId: string,
     integrationId: string | undefined,
@@ -13633,7 +13867,7 @@ export class Daemon {
   ): Promise<string | undefined> {
     // A scheduled run, a hook or another agent's call names no platform message to decide on, so it keeps its own session.
     if (msg.source !== 'user') return undefined
-    // A room keyed as one thread has no root: its one session takes every message, the task's when it is a task's place (§6.8).
+    // A room keyed as one thread has no root: its one session takes every message, the task's while a task holds it (§6.8).
     if (wholeRoomThread(msg)) return undefined
     const at = { platform: int.platform, channel: msg.channel, transportScope: msg.transportScope ?? null }
     // Minted before the thread lookup, so a thread session the switch into `auto` adopts keeps its thread (§3.5).
@@ -13694,17 +13928,27 @@ export class Daemon {
     return minted
   }
 
-  /** Open a coordinator turn on its batch: the trigger and every channel message queued behind it, each under its own id (auto-session-mode.md §4.3). */
+  /** Open a coordinator turn on its batch: the trigger, the channel messages right behind it of one permission class and the reports among them, each under its own id (auto-session-mode.md §3.4, §4.3, assistant-mode.md §5.18 ③④). */
   private async beginCoordinatorTurn(entry: QueueEntry, key: string): Promise<void> {
+    const lookups = this.placeMembers.lookupsFor(entry.agentId)
+    const snapshot = [...(this.serialQueue.get(key) ?? [])]
+    const joins = (one: QueueEntry): boolean => reportJoinsBatch(one.msg, one.callMeta)
+    const cut = await batchCut(entry, snapshot, {
+      ownTurn: (one) => one.webchat !== undefined,
+      // A report with turn metadata, such as a getting-to-know report's proposals, keeps a turn of its own (§3.4).
+      heads: (one) => one.msg.source !== 'user' && !joins(one),
+      report: joins,
+      classOf: (one) => askerClass(this.turnMessageOf(one), one.integrationId, lookups)
+    })
+    const chosen = new Set(snapshot.slice(0, cut))
+    // Only a prefix of the queue as it is now, so an arrival or a removal during the lookups reorders nothing.
     const queued = this.serialQueue.get(key) ?? []
-    // A queued report keeps a turn of its own, whose metadata it needs, such as a getting-to-know report's proposals (§3.4); so does a webchat message, whose reply streams to its own browser turn (§10).
-    const ownTurn = (next: QueueEntry) => next.msg.source !== 'user' || next.webchat !== undefined
-    const kept = queued.filter(ownTurn)
-    if (kept.length > 0) this.serialQueue.set(key, kept)
-    else this.serialQueue.delete(key)
+    let taken = 0
+    while (taken < queued.length && chosen.has(queued[taken]!)) taken += 1
+    if (taken === queued.length) this.serialQueue.delete(key)
+    else if (taken > 0) this.serialQueue.set(key, queued.slice(taken))
     const batch: QueueEntry[] = []
-    for (const next of queued) {
-      if (ownTurn(next)) continue
+    for (const next of queued.slice(0, taken)) {
       // The same holds the runner honors before it starts a queued entry.
       const verdict = next.admissionHold ? await next.admissionHold : 'run'
       next.admissionHold = undefined
@@ -13718,10 +13962,17 @@ export class Daemon {
       next.admissionWait = undefined
       if (next.deferObservedInbound) await this.admitInbound(next.msg, next.agentId)
       batch.push(next)
+      // Before the model sees it, so every read and write of the turn is judged by every sender.
+      this.noteFoldedMessage(key, next)
     }
     entry.coordinatorBatch = batch
     const messages = [entry, ...batch].map((one) =>
-      deliveredMessage(one.msg, one.integrationId, one.webchat !== undefined)
+      deliveredMessage(
+        one.msg,
+        one.integrationId,
+        one.webchat !== undefined,
+        reportAboutOf(one.agentId, one.msg, one.callMeta)
+      )
     )
     this.coordinators.beginTurn(key, entry.agentId, messages)
     const { channel } = entry.msg
@@ -13761,7 +14012,7 @@ export class Daemon {
     for (const agentId of this.agents.keys()) {
       if (this.draining) return
       if (!this.servesAgent(agentId)) continue
-      const closed = await this.store.assistantSubsessions.closeIdleThreaded(agentId, idleBefore)
+      const closed = await this.store.assistantSubsessions.closeIdleThreaded(agentId, idleBefore, this.clock.now())
       for (const key of closed)
         this.log.info(`task ${key} closed after a week idle; its threads go back to the coordinator`)
       await this.reportTaskOwners(agentId, closed)
@@ -13784,7 +14035,8 @@ export class Daemon {
           if (!owners.has(owner)) owners.set(owner, this.coordinatorRunsAuto(agentId, owner))
           // A task in a place of its own goes with its coordinator's conversation, not the place's (§6.8).
           if (((await owners.get(owner)) ?? runs) === true) continue
-          if (await index.closeTask(agentId, task.childSessionKey)) released.push(task.childSessionKey)
+          if (await index.closeTask(agentId, task.childSessionKey, this.clock.now()))
+            released.push(task.childSessionKey)
         }
         for (const key of released)
           this.log.info(`task ${key} is an ordinary thread session again: its conversation left auto`)
@@ -13861,12 +14113,60 @@ export class Daemon {
       .catch((err) => this.log.warn(`task ${key}: marking its turn running failed: ${formatErr(err)}`))
   }
 
-  /** A threaded task's turn ended: it is idle until its threads speak again (auto-session-mode.md §6.2). */
-  private async settleThreadedTaskTurn(entry: QueueEntry, key: string): Promise<void> {
+  /** A threaded task's turn ended: it is idle until its threads speak again (auto-session-mode.md §6.2); a run it ended in a room it holds reports (§6.8). */
+  private async settleThreadedTaskTurn(entry: QueueEntry, key: string, ended: TurnAcknowledgementEnd): Promise<void> {
     if (isAppendCoordinate(sessionThreadOf(entry.msg))) return
     await this.store.assistantSubsessions
       .finish(entry.agentId, key, 'done')
       .catch((err) => this.log.warn(`task ${key}: settling its turn failed: ${formatErr(err)}`))
+    if (entry.msg.sessionChannel === undefined || !wholeRoomThread(entry.msg)) return
+    // Taken whether or not this turn reports, so a later run never carries this turn's output.
+    const output = this.collab.takeFinalOutput(key)
+    // A stopped run was stopped there on purpose, and the run goes on while its room's messages are queued.
+    if ((ended !== 'completed' && ended !== 'failed') || (this.serialQueue.get(key)?.length ?? 0) > 0) return
+    await this.reportRoomRun(entry, key, ended, ended === 'completed' ? output : undefined).catch((err) =>
+      this.log.warn(`task ${key}: reporting its run in ${entry.msg.channel} failed: ${formatErr(err)}`)
+    )
+  }
+
+  /** A task's run in a room it holds reports its final output to its coordinator, which may relay it in the origin thread (auto-session-mode.md §6.8). */
+  private async reportRoomRun(
+    entry: QueueEntry,
+    key: string,
+    ended: 'completed' | 'failed',
+    output: string | undefined
+  ): Promise<void> {
+    const { agentId, msg, integrationId } = entry
+    const row = await this.store.assistantSubsessions.get(agentId, key)
+    if (!row || row.mode === 'watch') return
+    const owner = await this.store.getSession(row.parentSessionKey)
+    const link = sessionThreadUrlFor(
+      { platform: msg.platform, channel: msg.channel, thread: msg.channel },
+      integrationId === undefined ? undefined : this.connForIntegration(integrationId)
+    )
+    const report = roomRunReport(ended, row.title, output, row.summary, link)
+    const delivered = await this.collab.deliverDaemonReport({
+      agentId,
+      caller: {
+        platform: msg.platform,
+        channel: sessionChannelOf(msg),
+        thread: sessionThreadOf(msg),
+        ...(msg.transportScope !== undefined ? { transportScope: msg.transportScope } : {})
+      },
+      ...(owner
+        ? { place: { platform: owner.platform, channel: owner.channel, transportScope: owner.transportScope ?? null } }
+        : {}),
+      parentSessionId: row.parentSessionId,
+      text: report.text,
+      shown: report.shown,
+      // One per run: each turn of a threaded task is a round of its own.
+      reportId: `room-run:${key}:${row.round ?? 1}`,
+      hopCount: entry.callMeta?.hopCount ?? 0,
+      ownerSessionKey: row.parentSessionKey,
+      // Its coordinator answers it in the thread the task was opened in.
+      ...(row.replyThread !== undefined ? { replyThread: row.replyThread } : {})
+    })
+    if (!delivered.admitted) this.log.warn(`task ${key}: its run report was not delivered (${delivered.reason})`)
   }
 
   /** The coordinator's empty working directory where its runtime reads files, made there; undefined opens it in the agent's (auto-session-mode.md §5.4). */
@@ -13906,25 +14206,7 @@ export class Daemon {
     return () => void placed.then(() => conn.unreact?.call(conn, at.channel, at.messageId, 'triaging')).catch(() => {})
   }
 
-  /** A conversation of its own for a coordinator's task, where the message's platform makes one and its sender may have the agent make something new (auto-session-mode.md §6.8). */
-  private async openTaskPlace(
-    agentId: string,
-    integrationId: string | undefined,
-    msg: NormalizedMessage,
-    title: string
-  ): Promise<TaskPlace | undefined> {
-    if (integrationId === undefined || msg.source !== 'user') return undefined
-    const conn: Partial<ContractConnection> | undefined = this.anyConnForIntegration(integrationId)
-    if (!conn?.openTaskPlace) return undefined
-    const lookups = this.placeMembers.lookupsFor(agentId)
-    if (!(await memberMakesNew(msg.platform, integrationId, msg.sender.id, lookups))) return undefined
-    return await conn.openTaskPlace(
-      { agentId, channel: msg.channel, messageId: platformMessageIdOf(msg), isDm: msg.isDm },
-      title
-    )
-  }
-
-  /** A task's place closed on its platform, as an archived code channel does: the task it holds closes and its owner hears it (auto-session-mode.md §6.8). */
+  /** A room a task holds closed on its platform, as an archived code channel does: the task closes and its owner hears it (auto-session-mode.md §6.8). */
   private async closeTaskPlace(
     at: { platform: string; channel: string; thread: string },
     srcIntegrationIds: readonly string[]
@@ -13939,7 +14221,7 @@ export class Daemon {
       )
       for (const transportScope of scopes) {
         const task = await index.taskOfThread(agentId, { ...at, transportScope: transportScope ?? null })
-        if (task === undefined || !(await index.closeTask(agentId, task))) continue
+        if (task === undefined || !(await index.closeTask(agentId, task, this.clock.now()))) continue
         this.log.info(`task ${task} closed: its place ${at.channel} was archived`)
         await this.reportTaskOwners(agentId, [task])
       }
@@ -14196,8 +14478,7 @@ export class Daemon {
     gate?: GateDispatchOptions
   ): Promise<{ kind: 'rejected'; reason: DeliveryRejectionReason } | { kind: 'dispatched'; handle: DeliveryHandle }> {
     const { agentId, integrationId, msg: targetMsg, via, primary } = target
-    const coordinate = await this.sessionCoordinateFor(agentId, integrationId, targetMsg)
-    if (coordinate !== undefined) targetMsg.sessionThread = coordinate
+    await this.keySession(agentId, integrationId, targetMsg)
     // Agent-scoped drain: the agent is being reclaimed, so new turns drop while in-flight ones finish.
     if (this.drainingAgents.has(agentId)) {
       this.log.debug(`routing: dropping ${targetMsg.msgId} for agent "${agentId}" (draining)`)
@@ -14205,7 +14486,13 @@ export class Daemon {
     }
     // `!stop` mute: only an explicit @mention dispatches (and clears it); muted traffic stays an observation.
     const targetThread = sessionThreadOf(targetMsg)
-    const muteKey = sessionKey(targetMsg.platform, targetMsg.channel, targetThread, agentId, targetMsg.transportScope)
+    const muteKey = sessionKey(
+      targetMsg.platform,
+      sessionChannelOf(targetMsg),
+      targetThread,
+      agentId,
+      targetMsg.transportScope
+    )
     // An append conversation is never muted (§6.3): a leftover latch must not silence the room's one session.
     if (!isAppendCoordinate(targetThread) && (await this.commands.isSessionMuted(muteKey))) {
       if (via !== 'mention') {
@@ -14241,7 +14528,7 @@ export class Daemon {
             agentId,
             sessionKey: sessionKey(
               targetMsg.platform,
-              targetMsg.channel,
+              sessionChannelOf(targetMsg),
               sessionThreadOf(targetMsg),
               agentId,
               targetMsg.transportScope
@@ -14661,11 +14948,10 @@ export class Daemon {
     // `handleRelayIm` applies the `!stop` gate only on the path this branch returns
     // before, so an implicit continuation is checked against it here — otherwise a muted
     // conversation would silence its humans and none of its agents.
-    const relayCoordinate = await this.sessionCoordinateFor(msg.agentId, msg.integrationId, normalized)
-    if (relayCoordinate !== undefined) normalized.sessionThread = relayCoordinate
+    await this.keySession(msg.agentId, msg.integrationId, normalized)
     const muteKey = sessionKey(
       normalized.platform,
-      normalized.channel,
+      sessionChannelOf(normalized),
       sessionThreadOf(normalized),
       msg.agentId,
       normalized.transportScope
@@ -14949,11 +15235,10 @@ export class Daemon {
     // already in the channel record (step 1), with no admission.
     // Pre-addressed to exactly one agent, so the coordinate resolves for it here — the
     // relay path never reaches the per-target fan-out that resolves it for direct ingress.
-    const imCoordinate = await this.sessionCoordinateFor(msg.agentId, msg.integrationId, normalized)
-    if (imCoordinate !== undefined) normalized.sessionThread = imCoordinate
+    await this.keySession(msg.agentId, msg.integrationId, normalized)
     const muteKey = sessionKey(
       normalized.platform,
-      normalized.channel,
+      sessionChannelOf(normalized),
       sessionThreadOf(normalized),
       msg.agentId,
       normalized.transportScope
@@ -16007,7 +16292,31 @@ export class Daemon {
     if (!target) throw new Error('this session has no code-host repository to act on')
     const broker = this.codeHostBrokers.get(target.provider)
     if (!broker) throw new Error(`code-host effects are unavailable for ${target.provider} on this daemon`)
-    return await broker.execute({ ...target, agentId: req.agentId, sessionKey: key }, req.operation)
+    const result = await broker.execute({ ...target, agentId: req.agentId, sessionKey: key }, req.operation)
+    if (req.operation.kind === 'createMergeRequest')
+      await this.noteTaskOpened(req.agentId, key, createdObjectOf(result))
+    return result
+  }
+
+  /** A task that opened a pull request or merge request keeps it beside its record (assistant-mode.md §5.18 ④); any other session keeps nothing. */
+  private async noteTaskOpened(
+    agentId: string,
+    key: string,
+    opened: Omit<OpenedObject, 'openedAt'> | undefined
+  ): Promise<void> {
+    if (!opened) return
+    try {
+      await this.store.assistantSubsessions.recordOpened(agentId, key, { ...opened, now: this.clock.now() })
+    } catch (err) {
+      // What it records is a read aid: a failure never holds up the call or the feedback that found it.
+      this.log.warn(`task ${key}: recording ${opened.label} failed: ${formatErr(err)}`)
+    }
+  }
+
+  /** Each task key's short id, unique among the agent's task keys (assistant-mode.md §5.18 ④). */
+  private async shortTaskIdsOf(agentId: string): Promise<(key: string) => string> {
+    const ids = shortTaskIds(await this.store.assistantSubsessions.taskKeys(agentId), agentId)
+    return (key) => ids.get(key) ?? key
   }
 
   /** A follow-up check's watched GitLab project (assistant-mode.md §5.14), which the subscription verified; reads only. */
@@ -16015,7 +16324,7 @@ export class Daemon {
     agentId: string,
     key: string
   ): Promise<Omit<CodeHostEffectTarget, 'agentId' | 'sessionKey'> | undefined> {
-    const watch = (await this.store.assistantItems.byTaskKey(agentId, key))?.watch
+    const watch = (await this.store.assistantWatchTasks.get(agentId, key))?.watch
     if (watch?.state !== 'watching' || !watch.repoId) return undefined
     const parsed = parseFollowUpWatchUrl(watch.url)
     if (!('target' in parsed) || parsed.target.provider !== 'gitlab') return undefined
@@ -16587,7 +16896,7 @@ export class Daemon {
         agentId,
         transcriptChannel: transcriptChannelKey(msg.channel, msg.transportScope),
         coordinate,
-        sessionKey: sessionKey(msg.platform, msg.channel, coordinate, agentId, msg.transportScope),
+        sessionKey: sessionKey(msg.platform, sessionChannelOf(msg), coordinate, agentId, msg.transportScope),
         currentSeq: intake.seq,
         limit: DEFAULT_DECISION_GATE_LIMITS.backgroundRows
       })
@@ -16612,7 +16921,7 @@ export class Daemon {
       // few lines later and to SessionManager's — a divergence here would mint a second session.
       admission: {
         agentId,
-        sessionKey: sessionKey(msg.platform, msg.channel, thread, agentId, msg.transportScope)
+        sessionKey: sessionKey(msg.platform, sessionChannelOf(msg), thread, agentId, msg.transportScope)
       },
       ts,
       sender: msg.sender.id,
@@ -16854,7 +17163,13 @@ export class Daemon {
     }
     const { thread, ts } = transcriptCoords(entry.msg)
     const mention = attachmentMention(entry.msg.attachments)
-    const liveKey = sessionKey(entry.msg.platform, entry.msg.channel, thread, entry.agentId, entry.msg.transportScope)
+    const liveKey = sessionKey(
+      entry.msg.platform,
+      sessionChannelOf(entry.msg),
+      thread,
+      entry.agentId,
+      entry.msg.transportScope
+    )
     // §5.2a: the live webchat turn now also answers this activation, so its routing and reply scope fold it in.
     const live = routingFolded
       ? undefined
@@ -16894,7 +17209,7 @@ export class Daemon {
    *  failed — leaves the caller on today's queue path. */
   private async steerIntoLiveTurn(key: string, entry: QueueEntry): Promise<boolean> {
     if (!this.cfg.features.sessionSteering || !steerEligibleEntry(entry)) return false
-    const target = selectSteerTarget(this.pending.values(), key)
+    const target = selectSteerTarget(this.pending.values(), key, MAX_STEERS_PER_TURN, entry.msg.channel)
     if (!target) return false
     const host = target.selectedHost?.host ?? this.hostForOwner(target.hostKey)
     if (!host?.steeringSupported?.()) return false
@@ -17401,7 +17716,7 @@ export class Daemon {
     const { agentId, sessionKey: key } = p.plan
     const agent = this.agents.get(agentId)
     const row = await this.store.assistantSubsessions.get(agentId, key)
-    if (!row || row.kind === 'follow-up') return undefined
+    if (!row || row.mode === 'watch') return undefined
     const parent = await this.store.getSessionByOutwardId(row.parentSessionId, agentId)
     const route = {
       parentSessionId: row.parentSessionId,
@@ -18480,13 +18795,6 @@ export class Daemon {
     // A sub-session never speaks on the platform, whichever turn wakes it (assistant-mode.md §5.7); a coordinator speaks only through its outcomes (auto-session-mode.md §4.2).
     if (isSubsessionCoordinate(sessionThreadOf(msg)) || isCoordinatorCoordinate(sessionThreadOf(msg)))
       msg.headless = true
-    // The platform's copy of a message a task's place was made for opens that task with its title and background (auto-session-mode.md §6.8).
-    if (wholeRoomThread(msg))
-      await this.coordinators.placeOpening(
-        agentId,
-        sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), agentId, msg.transportScope),
-        msg
-      )
     // An agent-initiated wake's INBOUND message posts live too (#807 only posted the woken
     // REPLY, so the sender's message appeared on refresh but never in the live view). Mint
     // its canonical post identity before the inbox row persists so a replay reuses it and
@@ -18507,7 +18815,7 @@ export class Daemon {
     // THIS promise, not vanish as an unhandled rejection while the caller waits forever.
     return new Promise<string | null>((resolve, reject) => {
       void (async () => {
-        const key = sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), agentId, msg.transportScope)
+        const key = sessionKey(msg.platform, sessionChannelOf(msg), sessionThreadOf(msg), agentId, msg.transportScope)
         const reviewLane = reviewSubjectLane(hookContext, hookCoordinates(agentId, msg, integrationId))
         const safetyDrainByKey = this.safetyDrainAdmissionKeys.get(agentId)?.has(key) === true
         let admissionSettled = false
@@ -18545,7 +18853,7 @@ export class Daemon {
             if (result.accepted) {
               await this.store.admitActivation(
                 activationKey,
-                sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), agentId, msg.transportScope)
+                sessionKey(msg.platform, sessionChannelOf(msg), sessionThreadOf(msg), agentId, msg.transportScope)
               )
             } else {
               // Never admitted ⇒ give the claim back, so a retry is a first attempt rather
@@ -19313,7 +19621,7 @@ export class Daemon {
             if (!this.retainsInboxRow(entry, false)) await this.removeInbox(entry)
             if (isSubsessionCoordinate(sessionThreadOf(entry.msg)))
               await this.settleSubsessionTurn(entry, key, ended === 'completed' ? 'completed' : 'interrupted')
-            else if (this.cfg.features.autoSessionMode) await this.settleThreadedTaskTurn(entry, key)
+            else if (this.cfg.features.autoSessionMode) await this.settleThreadedTaskTurn(entry, key, ended)
             await this.settleCoordinatorTurn(entry, key, entry.coordinatorEnded ?? 'stopped', sessionId, {
               replayed: this.retainsInboxRow(entry, false)
             })
@@ -19327,7 +19635,7 @@ export class Daemon {
           // A shutdown drain's throw is the deadline-cancel of an admitted turn, whose row startup replay recovers.
           if (!this.retainsInboxRow(entry, true)) await this.removeInbox(entry)
           if (isSubsessionCoordinate(sessionThreadOf(entry.msg))) await this.settleSubsessionTurn(entry, key, 'failed')
-          else if (this.cfg.features.autoSessionMode) await this.settleThreadedTaskTurn(entry, key)
+          else if (this.cfg.features.autoSessionMode) await this.settleThreadedTaskTurn(entry, key, 'failed')
           await this.settleCoordinatorTurn(entry, key, 'failed', null, { replayed: this.retainsInboxRow(entry, true) })
           entry.reject(err)
           // A coordinator's queue holds separate people's messages, never follow-ups of the failed one: they still run (§4.3).
@@ -22577,7 +22885,7 @@ export class Daemon {
               agentId,
               sessionKey: sessionKey(
                 anchor.msg.platform,
-                anchor.msg.channel,
+                sessionChannelOf(anchor.msg),
                 transcriptCoords(anchor.msg).thread,
                 agentId,
                 anchor.msg.transportScope
@@ -24462,7 +24770,7 @@ export class Daemon {
       return
     }
     const isAnswerChunk = update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text'
-    // A one-message coordinator turn answers with the text after its last call (auto-session-mode.md §4.3).
+    // A coordinator turn's text after its last call, which only a browser that streamed it shows (auto-session-mode.md §4.3).
     if (isCoordinatorCoordinate(p.plan.sessionThread)) {
       if (isAnswerChunk) this.coordinators.turns.noteText(p.plan.sessionKey, String(update.content.text ?? ''))
       else if (update?.sessionUpdate === 'tool_call') this.coordinators.turns.noteToolCall(p.plan.sessionKey)
@@ -25029,9 +25337,14 @@ export class Daemon {
     // A console continuation onto a hook session or a task is not a new audience claiming a runtime — it IS that session, whose audience its delivery cannot re-derive, so the row keeps its binding (§9; auto-session-mode.md §10).
     if (msg.adoptedSession && (originKindOf(msg.platform) === 'hook' || isSubsessionCoordinate(sessionThreadOf(msg))))
       return 'unchanged'
+    const existing = await this.store.getSession(key)
     const direct =
       codeHostExternalSource(hookContext) ??
-      (await this.conversationExternalSource(agentId, msg, postlessCall(callMeta)))
+      (await this.conversationExternalSource(
+        agentId,
+        await this.heldRoomAudience(agentId, key, msg, existing),
+        postlessCall(callMeta)
+      ))
     // Conversation audiences require both a realm and integration; repository audiences carry their own proof.
     if (
       direct?.externalResourceKind === 'conversation' &&
@@ -25051,7 +25364,6 @@ export class Daemon {
             externalResourceKey: inherited.resourceKey
           }
         : undefined)
-    const existing = await this.store.getSession(key)
     if (!existing) return 'unchanged'
 
     // An A2A turn with no external lineage cannot enter an externally-bound
@@ -25075,6 +25387,20 @@ export class Daemon {
       return 'unchanged'
     }
     return 'mismatch'
+  }
+
+  /** A message in a room the session's task holds is that task's own audience, judged as the session's conversation (auto-session-mode.md §6.8). */
+  private async heldRoomAudience(
+    agentId: string,
+    key: string,
+    msg: NormalizedMessage,
+    session: SessionRecord | undefined
+  ): Promise<NormalizedMessage> {
+    if (!session || sessionChannelOf(msg) === msg.channel || !wholeRoomThread(msg)) return msg
+    const room = { platform: msg.platform, channel: msg.channel, transportScope: msg.transportScope ?? null }
+    if ((await this.store.assistantSubsessions.taskOfThread(agentId, { ...room, thread: msg.channel })) !== key)
+      return msg
+    return { ...msg, channel: session.channel, thread: session.thread, isDm: session.conversationKind === 'dm' }
   }
 
   private async classifyNewSessionOrThrow(
@@ -25225,6 +25551,8 @@ export class Daemon {
       session.transportScope
     )
     if (session.key !== expectedKey) return deferred('not_found')
+    // The Control Plane names the pull request this session opened: a task keeps it (assistant-mode.md §5.18 ④).
+    await this.noteTaskOpened(req.agentId, session.key, feedbackPullOf(req))
 
     const originKind = originKindOf(session.platform) ?? 'chat'
     const integrationId =
@@ -28907,7 +29235,13 @@ export class Daemon {
       // assistant-mode.md §5.7 step 1: an approved task is never re-run; it is reported as uncertain instead.
       if (isTaskCoordinate(sessionThreadOf(msg))) {
         await this.store.removeInbox(row.id)
-        const key = sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), row.agentId, msg.transportScope)
+        const key = sessionKey(
+          msg.platform,
+          sessionChannelOf(msg),
+          sessionThreadOf(msg),
+          row.agentId,
+          msg.transportScope
+        )
         await this.tasks.cut(row.agentId, key, callerOfMessage(msg))
         continue
       }
@@ -28921,7 +29255,13 @@ export class Daemon {
       const cleanup = codeHostThreadWorktreeCleanup(hookContext)
       const deleted = githubDeletedHookEvent(hookContext)
       if (hookContext && (cleanup || deleted)) {
-        const key = sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), row.agentId, msg.transportScope)
+        const key = sessionKey(
+          msg.platform,
+          sessionChannelOf(msg),
+          sessionThreadOf(msg),
+          row.agentId,
+          msg.transportScope
+        )
         const owner: HookCompletionOwner = { inboxId: row.id }
         this.liveInboxIds.add(row.id)
         if (cleanup) void this.githubReviews.completeGithubThreadWorktreeCleanup(hookContext, key, cleanup, owner)
@@ -29353,9 +29693,8 @@ export class Daemon {
     // A cron firing into a conversation is "equivalent to a user posting the trigger
     // in-channel", so it joins the same session a user's message would — resolved before
     // the key below, which the gate and every later step read.
-    const anchorCoordinate = await this.sessionCoordinateFor(agentId, target?.integrationId, msg)
-    if (anchorCoordinate !== undefined) msg.sessionThread = anchorCoordinate
-    const key = sessionKey(msg.platform, msg.channel, sessionThreadOf(msg), agentId, msg.transportScope)
+    await this.keySession(agentId, target?.integrationId, msg)
+    const key = sessionKey(msg.platform, sessionChannelOf(msg), sessionThreadOf(msg), agentId, msg.transportScope)
     // Gate BEFORE the anchor side effect. Cron scheduling remains registered while an
     // agent is paused, but a paused/draining/safety-stopping agent must publish nothing
     // and start no turn.

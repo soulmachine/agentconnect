@@ -22,7 +22,9 @@ import {
   SUBSESSION_COORDINATE_PREFIX
 } from '../session/subsession-coordinate.js'
 import type { AssistantDraft, AssistantDraftLedger } from '../store/assistant-drafts.js'
-import type { AssistantItem, AssistantItemLedger } from '../store/assistant-items.js'
+import { readCheckedTask, type CheckedTask } from '../assistant/checked-tasks.js'
+import type { AssistantItemLedger } from '../store/assistant-items.js'
+import type { AssistantWatchTasks } from '../store/assistant-watch-tasks.js'
 import type { AssistantCheckLedger } from '../store/assistant-checks.js'
 import type { AssistantSubsession, AssistantSubsessionIndex } from '../store/assistant-subsessions.js'
 import type { SessionRecord } from '../store/local-store.js'
@@ -40,12 +42,14 @@ export class AssistantActivityViolationError extends Error {
 
 /** What the view reads and edits; every query is scoped by the agent the request names. */
 export interface AssistantActivityStore {
-  assistantItems: Pick<AssistantItemLedger, 'get' | 'byTaskKey'>
+  /** Watch tasks, and the getting-to-know tasks the item ledger keeps, read by their one id. */
+  assistantWatchTasks: Pick<AssistantWatchTasks, 'get'>
+  assistantItems: Pick<AssistantItemLedger, 'byTaskKey'>
   assistantChecks: Pick<AssistantCheckLedger, 'get' | 'checks'>
   assistantDrafts: Pick<AssistantDraftLedger, 'listPending' | 'get'>
   assistantSubsessions: Pick<
     AssistantSubsessionIndex,
-    'list' | 'listForParent' | 'get' | 'adoptFollowUps' | 'threadsOf'
+    'list' | 'listForParent' | 'get' | 'adoptWatchTasks' | 'threadsOf'
   >
   getSession(key: string): Promise<SessionRecord | undefined>
   getSessionByOutwardId(sessionId: string, agentId?: string): Promise<SessionRecord | undefined>
@@ -75,7 +79,7 @@ export interface AssistantActivityDeps {
   /** End a follow-up from the console (assistant-mode.md §5.12); `ended` when it already had. */
   stopFollowUp?(
     agentId: string,
-    item: AssistantItem,
+    item: CheckedTask,
     actor: { userId: string; name?: string }
   ): Promise<'stopped' | 'ended'>
   /** Background sub-sessions' permission requests still waiting on a human (assistant-mode.md §5.6), decided through the approval queue. */
@@ -90,6 +94,55 @@ export interface AssistantActivity {
 
 // Room for the answer's own fields around its list.
 const ANSWER_OVERHEAD_BYTES = 1_024
+
+// The console and platform task views read the same scoped rows and follow-up adoption.
+export async function readTaskSubsessions(
+  store: AssistantActivityStore,
+  req: Extract<AssistantActivityReadReq, { operation: 'subsessions' }>,
+  assistant: boolean
+): Promise<Extract<AssistantActivityReadResult, { operation: 'subsessions' }>> {
+  const subsessionOf = (row: AssistantSubsession) => taskOf(store, req.agentId, row)
+  const delegationsOnly = !assistant
+  if (!req.parent) {
+    const rows = await store.assistantSubsessions.list(req.agentId, req.limit + 1, { delegationsOnly })
+    const { kept, trimmed } = withinBudget(await Promise.all(rows.slice(0, req.limit).map(subsessionOf)))
+    return {
+      operation: 'subsessions',
+      subsessions: kept,
+      truncated: rows.length > req.limit || trimmed,
+      followUps: true
+    }
+  }
+  if (assistant && req.parent.cursor === undefined) {
+    const rec = await store.getSessionByOutwardId(req.parent.sessionId, req.agentId)
+    if (rec?.agentId === req.agentId && !isSubsessionCoordinate(rec.thread)) {
+      const place = await store.placeSession(req.agentId, rec.platform, rec.channel, rec.transportScope ?? null)
+      if (place?.key === rec.key)
+        await store.assistantSubsessions.adoptWatchTasks(
+          req.agentId,
+          { platform: rec.platform, channel: rec.channel, transportScope: rec.transportScope ?? null },
+          { sessionId: req.parent.sessionId, key: rec.key }
+        )
+    }
+  }
+  const after = req.parent.cursor === undefined ? undefined : cursorPosition(req.parent.cursor)
+  const rows = await store.assistantSubsessions.listForParent(req.agentId, req.parent.sessionId, {
+    limit: req.limit + 1,
+    ...(after ? { after } : {}),
+    delegationsOnly
+  })
+  const page = rows.slice(0, req.limit)
+  const { kept, trimmed } = withinBudget(await Promise.all(page.map(subsessionOf)))
+  const last = page[kept.length - 1]
+  const more = (rows.length > req.limit || trimmed) && last !== undefined
+  return {
+    operation: 'subsessions',
+    subsessions: kept,
+    truncated: more,
+    nextCursor: more ? cursorOf(last) : null,
+    followUps: true
+  }
+}
 
 export function createAssistantActivity(deps: AssistantActivityDeps): AssistantActivity {
   // Only an agent this daemon holds; true while it is in assistant mode, whose follow-ups and proposals the view adds.
@@ -116,19 +169,6 @@ export function createAssistantActivity(deps: AssistantActivityDeps): AssistantA
     if (rec?.agentId !== agentId || rec.platform !== 'webchat' || isSubsessionCoordinate(rec.thread)) return undefined
     return { platform: rec.platform, channel: rec.channel }
   }
-  // A conversation that is its place's current long session owns the place's follow-ups, so they are listed under it.
-  const adoptInto = async (store: AssistantActivityStore, agentId: string, sessionId: string): Promise<void> => {
-    const rec = await store.getSessionByOutwardId(sessionId, agentId)
-    if (rec?.agentId !== agentId || isSubsessionCoordinate(rec.thread)) return
-    const place = await store.placeSession(agentId, rec.platform, rec.channel, rec.transportScope ?? null)
-    if (place?.key !== rec.key) return
-    await store.assistantSubsessions.adoptFollowUps(
-      agentId,
-      { platform: rec.platform, channel: rec.channel, transportScope: rec.transportScope ?? null },
-      { sessionId, key: rec.key }
-    )
-  }
-
   return {
     async read(req) {
       const assistant = admit(req.agentId)
@@ -139,47 +179,14 @@ export function createAssistantActivity(deps: AssistantActivityDeps): AssistantA
           return { operation: 'items', items: [], truncated: false }
         case 'item':
           return { operation: 'item', item: null }
-        case 'subsessions': {
-          const subsessionOf = (row: AssistantSubsession) => taskOf(store, req.agentId, row)
-          // Follow-ups are listed only in assistant mode.
-          const delegationsOnly = !assistant
-          if (!req.parent) {
-            const rows = await store.assistantSubsessions.list(req.agentId, req.limit + 1, { delegationsOnly })
-            // A follow-up row carries its checks, so the wire budget, not the row limit, bounds the answer.
-            const { kept, trimmed } = withinBudget(await Promise.all(rows.slice(0, req.limit).map(subsessionOf)))
-            return {
-              operation: 'subsessions',
-              subsessions: kept,
-              truncated: rows.length > req.limit || trimmed,
-              followUps: true
-            }
-          }
-          if (assistant && req.parent.cursor === undefined) await adoptInto(store, req.agentId, req.parent.sessionId)
-          const after = req.parent.cursor === undefined ? undefined : cursorPosition(req.parent.cursor)
-          const rows = await store.assistantSubsessions.listForParent(req.agentId, req.parent.sessionId, {
-            limit: req.limit + 1,
-            ...(after ? { after } : {}),
-            delegationsOnly
-          })
-          const page = rows.slice(0, req.limit)
-          const { kept, trimmed } = withinBudget(await Promise.all(page.map(subsessionOf)))
-          // The next page starts after the last row this answer actually carries.
-          const last = page[kept.length - 1]
-          const more = (rows.length > req.limit || trimmed) && last !== undefined
-          return {
-            operation: 'subsessions',
-            subsessions: kept,
-            truncated: more,
-            nextCursor: more ? cursorOf(last) : null,
-            followUps: true
-          }
-        }
+        case 'subsessions':
+          return readTaskSubsessions(store, req, assistant)
         case 'task': {
           const child = await store.getSessionByOutwardId(req.sessionId, req.agentId)
           const row =
             child?.agentId === req.agentId ? await store.assistantSubsessions.get(req.agentId, child.key) : undefined
           // A follow-up is shown only in assistant mode, as the list does.
-          if (!row || (row.kind === 'follow-up' && !assistant)) return { operation: 'task', task: null }
+          if (!row || (row.mode === 'watch' && !assistant)) return { operation: 'task', task: null }
           return { operation: 'task', task: await taskOf(store, req.agentId, row) }
         }
         case 'drafts': {
@@ -202,9 +209,10 @@ export function createAssistantActivity(deps: AssistantActivityDeps): AssistantA
           )
           const titles = new Map<string, string | null>()
           for (const draft of page) {
-            const itemId = draft.proposal?.itemId
-            if (itemId && !titles.has(itemId))
-              titles.set(itemId, (await store.assistantItems.get(req.agentId, itemId))?.title ?? null)
+            // A proposal names its follow-up or getting-to-know task by that task's key.
+            const taskKey = draft.proposal?.itemId
+            if (taskKey && !titles.has(taskKey))
+              titles.set(taskKey, (await checkedTaskOf(store, req.agentId, taskKey))?.title ?? null)
           }
           const { kept, trimmed } = withinBudget(page.map((draft) => draftOf(draft, names, titles)))
           // Permission requests only for a Control Plane that asked, as proposals are, and never with one conversation's proposals.
@@ -245,8 +253,8 @@ export function createAssistantActivity(deps: AssistantActivityDeps): AssistantA
           const { userId, name } = req.actor
           const actor = { userId, ...(name ? { name } : {}) }
           // A follow-up's Stop ends it (assistant-mode.md §5.12), not just its check.
-          if (row.kind === 'follow-up') {
-            const item = await store.assistantItems.byTaskKey(req.agentId, row.childSessionKey)
+          if (row.mode === 'watch') {
+            const item = await checkedTaskOf(store, req.agentId, row.childSessionKey)
             if (!item || !deps.stopFollowUp) return { operation: 'stop-subsession', result: 'not-found' }
             const ended = await deps.stopFollowUp(req.agentId, item, actor)
             return { operation: 'stop-subsession', result: ended === 'stopped' ? 'stopped' : 'not-running' }
@@ -256,9 +264,9 @@ export function createAssistantActivity(deps: AssistantActivityDeps): AssistantA
         }
         case 'stop-follow-up': {
           // Only while its row names the conversation the Control Plane checked the caller against, so no other place's follow-up ends.
-          const item = await store.assistantItems.get(req.agentId, req.followUpId)
+          const item = await checkedTaskOf(store, req.agentId, req.followUpId)
           const row = item ? await store.assistantSubsessions.get(req.agentId, item.taskKey) : undefined
-          if (!item || row?.kind !== 'follow-up' || row.parentSessionId !== req.parentSessionId || !deps.stopFollowUp)
+          if (!item || row?.mode !== 'watch' || row.parentSessionId !== req.parentSessionId || !deps.stopFollowUp)
             return { operation: 'stop-follow-up', result: 'not-found' }
           const { userId, name } = req.actor
           const ended = await deps.stopFollowUp(req.agentId, item, { userId, ...(name ? { name } : {}) })
@@ -268,6 +276,14 @@ export function createAssistantActivity(deps: AssistantActivityDeps): AssistantA
     }
   }
 }
+
+/** A follow-up or a getting-to-know task by its one id, the task key. */
+const checkedTaskOf = (
+  store: AssistantActivityStore,
+  agentId: string,
+  taskKey: string
+): Promise<CheckedTask | undefined> =>
+  readCheckedTask({ watchTasks: store.assistantWatchTasks, items: store.assistantItems }, agentId, taskKey)
 
 /** The Stop every surface shares (assistant-mode.md §5.8): an indexed sub-session's current turn, only while it is open. */
 export async function stopIndexedSubsession(
@@ -291,8 +307,8 @@ async function taskOf(
     parentSessionId: row.parentSessionId,
     createdAt: iso(row.createdAt)
   }
-  if (row.kind === 'follow-up') {
-    const item = await store.assistantItems.byTaskKey(agentId, row.childSessionKey)
+  if (row.mode === 'watch') {
+    const item = await checkedTaskOf(store, agentId, row.childSessionKey)
     const followUp = item ? await followUpOf(store, row, item) : undefined
     const ended = followUp?.status === 'done' || followUp?.status === 'stopped'
     return { ...base, state: ended ? 'done' : 'open', kind: 'follow-up', ...(followUp ? { followUp } : {}) }
@@ -316,9 +332,9 @@ async function taskOf(
 async function followUpOf(
   store: AssistantActivityStore,
   row: AssistantSubsession,
-  item: AssistantItem
+  item: CheckedTask
 ): Promise<AssistantActivityFollowUp> {
-  const state = await store.assistantChecks.get(item.agentId, item.id)
+  const state = await store.assistantChecks.get(item.agentId, item.taskKey)
   const open = item.status === 'active' || item.status === 'waiting'
   const status: AssistantActivityFollowUp['status'] = !open
     ? item.status === 'done'
@@ -329,14 +345,15 @@ async function followUpOf(
       : state?.stopped
         ? 'paused'
         : 'waiting'
-  const checks = await store.assistantChecks.checks(item.agentId, item.id, ASSISTANT_ACTIVITY_CHECKS_MAX + 1)
+  const checks = await store.assistantChecks.checks(item.agentId, item.taskKey, ASSISTANT_ACTIVITY_CHECKS_MAX + 1)
   return {
-    id: item.id,
+    // Its one id, which a console Stop sends back (`stop-follow-up`).
+    id: item.taskKey,
     title: item.title,
     doneWhen: item.doneWhen,
     status,
     // A getting-to-know task waits for the scheduled-check slot, not a time it set (assistant-mode.md §5.13).
-    nextCheck: open && item.nextCheck !== null && !item.gettingToKnow ? iso(item.nextCheck) : null,
+    nextCheck: open && item.nextAt !== null && !item.gettingToKnow ? iso(item.nextAt) : null,
     ...(item.gettingToKnow ? { gettingToKnow: true } : {}),
     // What it watches and what started each check (assistant-mode.md §5.14).
     ...(item.watch
